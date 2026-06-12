@@ -1,0 +1,15 @@
+# 虚拟环境（机器生成，启动ptt.command 首次运行自动重建）
+.venv/
+venv/
+
+# Python 运行产物
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 转换输出（不要把转换结果和源 PDF 传上去，尤其是保密文档）
+转换结果/
+转换结果示例/
+*.pdf
