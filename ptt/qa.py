@@ -4,6 +4,7 @@ import unicodedata
 from typing import List, Tuple
 
 from .models import Block, Line
+from .normalize import is_noise_text, looks_truncated, table_suspect_score
 from .vision_ocr import StripProvider, ocr_strip
 
 # 明确的乱码信号
@@ -11,8 +12,15 @@ _BAD_CHARS = re.compile(r'[�-]')  # 替换符 / 私用区
 _CID_RE = re.compile(r'\(cid:\d+\)')
 # 目录条目：引导点会拉低 OCR 置信度，但清洗后的文本本身没问题
 _TOC_LIKE = re.compile(r'^.{1,40}[　.\s。·•．…⋯：:\-－—]\d{1,3}$')
+_CLEAN_SECTION_HEADING = re.compile(
+    r'^[一二三四五六七八九十]{1,3}[、.．]\s*'
+    r'[0-9A-Za-z一-鿿（）()《》【】\s/-]{2,24}[.．。…⋯]?$')
+_CLEAN_FORM_FIELD = re.compile(r'^\d{1,2}[.．]\s*站点ID[:：]\s*_?站点名称$')
 # 数学公式信号：OCR 处理分式/上下标很不可靠，这类低置信块直接截图
 _MATH_RE = re.compile(r'[=≤≥×÷√∑∏∝≈≠＋＝]|[+*/^]\s*\d|\d\s*[+*/]')
+_WATERMARK_IN_TEXT = re.compile(
+    r'(?i)(?:bm[_\\-]*ch|chenj|chenjia|i?ang[o0]l|cheny|陈加强|陈加\d?)')
+_SUSPECT_OCR_TEXT = re.compile(r'[�俁仴雲抇讳冏昇銷埃門哭伿怯奂]')
 
 
 def garbled_score(text: str) -> float:
@@ -65,6 +73,9 @@ def recheck_ocr_blocks(blocks: List[Block], provider: StripProvider,
             from .assemble import cluster_rows, _join_lines, clean_leaders
             new_text = clean_leaders(_join_lines(cluster_rows(lines)))
             new_conf = min(l.conf for l in lines)
+            if _contains_watermark_noise(new_text):
+                blk.flags.append("low_confidence")
+                continue
             norm_old = re.sub(r'\s+', '', blk.text)
             norm_new = re.sub(r'\s+', '', new_text)
             if norm_new == norm_old:
@@ -78,7 +89,8 @@ def recheck_ocr_blocks(blocks: List[Block], provider: StripProvider,
                 if new_conf >= conf_thresh:
                     continue
         # 目录条目（引导点天然拉低置信度），文本干净即放行
-        if _TOC_LIKE.match(blk.text) and garbled_score(blk.text) == 0:
+        if _is_clean_low_confidence_text(blk.text):
+            blk.confidence = max(blk.confidence, conf_thresh)
             continue
         blk.flags.append("low_confidence")
     return notes
@@ -103,8 +115,7 @@ def image_fallback(blocks: List[Block], provider: StripProvider
         if not group:
             return
         single = len(group) == 1
-        if single and not (_MATH_RE.search(group[0].text)
-                           or garbled_score(group[0].text) > 0):
+        if single and not _should_image_fallback_single(group[0]):
             out.extend(group)
             group.clear()
             return
@@ -112,15 +123,22 @@ def image_fallback(blocks: List[Block], provider: StripProvider
         y1 = max(b.bbox[3] for b in group) + 8
         x0 = max(0, min(b.bbox[0] for b in group) - 60)
         x1 = min(provider.width, max(b.bbox[2] for b in group) + 60)
-        blk = Block(kind="image", page=group[0].page,
+        text = "\n".join(b.text for b in group if b.text)
+        flags = ["auto_image"]
+        if any(_MATH_RE.search(b.text or "") for b in group):
+            flags.append("formula")
+        blk = Block(kind="image", page=group[0].page, text=text,
                     bbox=(x0, max(0, y0), x1, min(provider.height, y1)),
-                    flags=["auto_image"])
+                    flags=flags)
         notes.append(f"低置信区域已转为截图(y={int(y0)}): "
                      + " / ".join(b.text[:18] for b in group[:3]))
         out.append(blk)
         group.clear()
 
     for b in sorted(blocks, key=lambda b: b.bbox[1]):
+        if b.kind in ("para", "heading") and _is_pure_noise_text(b.text):
+            notes.append(f"移除疑似水印片段: {b.text[:18]}")
+            continue
         if _is_bad(b):
             if group and b.bbox[1] - max(g.bbox[3] for g in group) > 250:
                 flush_group()
@@ -149,6 +167,51 @@ def image_fallback(blocks: List[Block], provider: StripProvider
         out = [b for b in out if id(b) not in absorbed]
     out.sort(key=lambda b: b.bbox[1])  # 吸收可能改变 bbox，重排保证视觉顺序
     return out, notes
+
+
+def _contains_watermark_noise(text: str) -> bool:
+    return bool(is_noise_text(text) or _WATERMARK_IN_TEXT.search(text or ""))
+
+
+def _is_clean_low_confidence_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or garbled_score(s) > 0 or _SUSPECT_OCR_TEXT.search(s):
+        return False
+    if _contains_watermark_noise(s):
+        return False
+    if _TOC_LIKE.match(s):
+        return True
+    return bool(_CLEAN_SECTION_HEADING.match(s) or _CLEAN_FORM_FIELD.match(s))
+
+
+def _is_pure_noise_text(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if not s:
+        return True
+    if is_noise_text(s):
+        return True
+    if len(s) <= 28 and re.fullmatch(r'[#_()（）|\\/.·.\-A-Za-z0-9]+', s) \
+            and re.search(r'(?i)ang|chen|bm|10901|1901', s):
+        return True
+    if len(s) <= 8 and re.fullmatch(r'[一二三四五六七八九十]?[A-Za-z0-9]{2,}', s):
+        return True
+    if len(s) <= 20 and _WATERMARK_IN_TEXT.search(s):
+        return True
+    return False
+
+
+def _should_image_fallback_single(blk: Block) -> bool:
+    text = blk.text or ""
+    compact = re.sub(r'\s+', '', text)
+    if _MATH_RE.search(text) or garbled_score(text) > 0:
+        return True
+    if _SUSPECT_OCR_TEXT.search(text):
+        return True
+    if _contains_watermark_noise(text):
+        return True
+    if blk.confidence <= 0.35 and len(compact) >= 18:
+        return True
+    return False
 
 
 # 高频 OCR 形近字混淆对：(误识字, 正确候选)。仅在全文词频投票支持时才改写
@@ -198,6 +261,12 @@ def doc_vote_fix(blocks: List[Block]) -> List[str]:
         out = list(t)
         for i, ch in enumerate(t):
             for repl in pair_map.get(ch, ()):
+                if ch == "O":
+                    prev = t[i - 1] if i > 0 else ""
+                    nxt = t[i + 1] if i + 1 < len(t) else ""
+                    if ((prev.isascii() and prev.isalpha())
+                            or (nxt.isascii() and nxt.isalpha())):
+                        continue
                 olds = [t[max(0, i - 1):i + 1], t[i:i + 2]]
                 news = [o.replace(ch, repl, 1) for o in olds]
                 so = max((bigrams[o] for o in olds if len(o) == 2), default=0)
@@ -240,4 +309,22 @@ def qa_scan(blocks: List[Block]) -> Tuple[List[str], int]:
             n_flag += 1
             issues.append(f"块{i} 低置信度({blk.confidence:.2f}): "
                           f"{(blk.text or '')[:40]}")
+        if "table_low_confidence" in blk.flags:
+            n_flag += 1
+            issues.append(f"块{i} 表格疑似列错位，建议人工复核")
+        elif blk.kind == "table" and blk.rows:
+            score = table_suspect_score(blk.rows)
+            if score >= 3:
+                if "table_low_confidence" not in blk.flags:
+                    blk.flags.append("table_low_confidence")
+                n_flag += 1
+                issues.append(f"块{i} 表格疑似列错位(score={score})，建议人工复核")
+        if "possible_truncation" in blk.flags:
+            n_flag += 1
+            issues.append(f"块{i} 疑似截断: {(blk.text or '')[:50]}")
+        elif blk.kind in ("para", "heading") and looks_truncated(blk.text):
+            if "possible_truncation" not in blk.flags:
+                blk.flags.append("possible_truncation")
+            n_flag += 1
+            issues.append(f"块{i} 疑似截断: {(blk.text or '')[:50]}")
     return issues, n_flag

@@ -9,6 +9,7 @@ import fitz
 from . import assemble, qa, text_extract
 from .export import export_docx, export_markdown
 from .models import Block, DocResult
+from .normalize import normalize_blocks
 from .vision_ocr import (EmbeddedImageProvider, RenderProvider, StripProvider,
                          ocr_provider)
 
@@ -81,8 +82,13 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
             for blk in blocks:
                 if blk.kind == "image" and not blk.image_path:
                     fig_count += 1
-                    y0, y1 = int(blk.bbox[1]), int(blk.bbox[3])
+                    x0, y0, x1, y1 = (int(blk.bbox[0]), int(blk.bbox[1]),
+                                      int(blk.bbox[2]), int(blk.bbox[3]))
                     img = provider.get_strip(max(0, y0 - 4), y1 + 4)
+                    x0 = max(0, min(img.width, x0))
+                    x1 = max(x0 + 1, min(img.width, x1))
+                    if x1 - x0 < img.width:
+                        img = img.crop((x0, 0, x1, img.height))
                     path = os.path.join(assets_dir, f"{safe}_fig{fig_count}.png")
                     img.save(path)
                     blk.image_path = path
@@ -92,6 +98,9 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
     vote_notes = qa.doc_vote_fix(result.blocks)
     if vote_notes:
         result.warnings.extend(vote_notes[:10])
+    norm_notes = normalize_blocks(result.blocks)
+    if norm_notes:
+        result.warnings.extend(norm_notes[:20])
 
     # 封面标题常被换行书写成多个一级标题 -> 合并为一个
     blks = result.blocks
@@ -125,12 +134,10 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         export_docx(result, p)
         outputs.append(p)
 
-    # 清理临时文件：docx 已内嵌图片，仅 md 需要外部资源目录
+    # Markdown 现在文本化图片/公式/表格，不再依赖外部 assets；
+    # docx 图片已在保存时内嵌，导出结束后也可删除临时图片目录。
     if os.path.isdir(assets_dir):
-        if "md" not in formats or not os.listdir(assets_dir):
-            shutil.rmtree(assets_dir, ignore_errors=True)
-        else:
-            outputs.append(assets_dir)
+        shutil.rmtree(assets_dir, ignore_errors=True)
     report("完成", 1.0)
     doc.close()
 

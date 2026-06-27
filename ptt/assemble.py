@@ -14,7 +14,9 @@ import numpy as np
 from PIL import Image
 
 from .models import Block, Line
-from .vision_ocr import StripProvider
+from .normalize import (clean_table_noise_rows, is_noise_text,
+                        looks_truncated, table_suspect_score)
+from .vision_ocr import StripProvider, ocr_strip
 
 # 仅由引导点/装饰符组成的行（目录里的 ……… 之类）
 _LEADER_RE = re.compile(r'^[\s.。·•．…⋯\-_—－]+$')
@@ -29,6 +31,9 @@ _LIST_START = re.compile(
 _TOC_ENTRY = re.compile(r'.+?[.。·•．…⋯\-_\s]*\d{1,3}$')
 # 纯数学碎片（分式被 OCR 拆出的分子/分母，如 "P"、"W+P"、"C+5*Y"）
 _MATH_FRAG = re.compile(r'^[A-Za-z0-9+\-*/×÷().,%\s≤≥<>＋－＊]+$')
+_ACCOUNT_WATERMARK = re.compile(r'(?i)(?:bm)?[a-z]{3,}[a-z0-9_]*\d{1,}')
+_COMMON_CN_NOISE_WORDS = ("美团", "配送", "标准", "站点", "管理", "合作", "商",
+                          "申诉", "检核", "区域", "规则", "内容")
 
 
 def _norm(text: str) -> str:
@@ -86,6 +91,10 @@ def detect_page_bands(lines: List[Line], page_h: float,
         if len(gaps):
             periods.append((len(grp), float(np.median(gaps))))
         notes.append(f"{grp[0].text[:28]}（{len(grp)}次）")
+
+    watermark_keys, watermark_notes = _detect_repeated_watermarks(groups, page_h)
+    anchors.update(watermark_keys)
+    notes.extend(watermark_notes)
 
     # 第二遍：已知页周期 P 后，间隔为 P 整数倍的重复行也是锚点
     # （页眉偶尔与 logo 误读黏成一行时，单独出现的次数会变少且间隔不均）
@@ -145,6 +154,57 @@ def detect_page_bands(lines: List[Line], page_h: float,
     return PageBands([tuple(m) for m in merged], anchors), notes
 
 
+def _detect_repeated_watermarks(groups, page_h: float) -> Tuple[set, List[str]]:
+    """识别斜向/散落账号水印。
+
+    这类水印不在固定页眉页脚带内，位置会横跨页面；只有账号形态或由账号
+    推导出的短姓名/前缀在页面大范围重复时才删除。
+    """
+    keys = set()
+    notes: List[str] = []
+    account_roots = set()
+    name_candidates = defaultdict(int)
+
+    def spread_ok(grp, min_y=0.12) -> bool:
+        if len(grp) < 3:
+            return False
+        ys = [g.cy for g in grp]
+        return max(ys) - min(ys) > page_h * min_y
+
+    for key, grp in groups.items():
+        if len(grp) < 3 or not spread_ok(grp):
+            continue
+        if _ACCOUNT_WATERMARK.search(key):
+            keys.add(key)
+            m = _ACCOUNT_WATERMARK.search(key)
+            root = re.sub(r'\d+$', '', m.group(0)) if m else key
+            if len(root) >= 4:
+                account_roots.add(root.lower())
+            sample = grp[0].text[:24]
+            notes.append(f"疑似账号水印 {sample}（{len(grp)}次）")
+            for ln in grp:
+                for run in re.findall(r'[一-鿿]{2,4}', ln.text):
+                    if not any(w in run for w in _COMMON_CN_NOISE_WORDS):
+                        name_candidates[_fuzzy(run)] += 1
+
+    if not keys:
+        return keys, notes
+
+    for key, grp in groups.items():
+        if key in keys or len(grp) < 3 or not spread_ok(grp):
+            continue
+        lower = key.lower()
+        if len(lower) >= 4 and any(root.startswith(lower) or lower.startswith(root)
+                                   for root in account_roots):
+            keys.add(key)
+            notes.append(f"疑似账号水印片段 {grp[0].text[:24]}（{len(grp)}次）")
+            continue
+        if name_candidates.get(key, 0) >= 2 and len(grp) >= 3:
+            keys.add(key)
+            notes.append(f"疑似姓名水印 {grp[0].text[:24]}（{len(grp)}次）")
+    return keys, notes
+
+
 def strip_header_footer(lines: List[Line], bands: PageBands
                         ) -> Tuple[List[Line], int]:
     """清除：锚点行（全部）+ 清除带内的短行/页码/装饰行（logo 误读、页码）。"""
@@ -167,7 +227,8 @@ def strip_header_footer(lines: List[Line], bands: PageBands
 
 
 def drop_noise(lines: List[Line]) -> List[Line]:
-    return [l for l in lines if not _LEADER_RE.match(l.text)]
+    return [l for l in lines
+            if not _LEADER_RE.match(l.text) and not is_noise_text(l.text)]
 
 
 def clean_leaders(text: str) -> str:
@@ -438,16 +499,72 @@ def find_table_regions(provider: StripProvider, bands: PageBands,
     return out
 
 
-def build_table_block(region: TableRegion, lines: List[Line], page: int
+def build_table_block(region: TableRegion, lines: List[Line], page: int,
+                      provider: Optional[StripProvider] = None,
+                      bands: Optional[PageBands] = None
                       ) -> Tuple[Optional[Block], set]:
     """把落在表格区域内的 OCR 行按网格分配到单元格。"""
     hy, vx = region.hy, region.vx
-    used_ids = set()
     if len(hy) < 2 or len(vx) < 2:
-        return None, used_ids
+        return None, set()
     nrows, ncols = len(hy) - 1, len(vx) - 1
     if ncols > 12 or nrows > 500:
-        return None, used_ids
+        return None, set()
+
+    used_ids = _table_line_ids(region, lines)
+    line_rows, line_conf = _table_rows_from_lines(region, lines)
+    rows, conf = line_rows, line_conf
+    flags: List[str] = []
+
+    line_score = table_suspect_score(line_rows)
+    if provider is not None and _should_cell_ocr(region, lines, line_rows, line_score):
+        cell_rows, cell_conf = _table_rows_from_cell_ocr(provider, region, bands)
+        if cell_rows:
+            cell_score = table_suspect_score(cell_rows)
+            line_fill = _filled_cells(line_rows)
+            cell_fill = _filled_cells(cell_rows)
+            enough_cell_text = (not line_rows
+                                or cell_fill >= max(2, int(line_fill * 0.35)))
+            if (enough_cell_text and (cell_score <= line_score
+                    or (line_score >= 3 and cell_fill >= max(2, int(line_fill * 0.45)))
+                    or _has_cross_column_lines(region, lines))):
+                rows, conf = cell_rows, min(line_conf, cell_conf)
+                flags.append("cell_ocr_table")
+
+    if not rows:
+        return None, set()
+    rows = clean_table_noise_rows(rows)
+    if not rows:
+        return None, set()
+    final_score = table_suspect_score(rows)
+    if final_score >= 3:
+        flags.append("table_low_confidence")
+        flags.append("table_fallback")
+        blk = Block(kind="image", rows=rows, page=page, confidence=conf,
+                    bbox=(region.x0, region.y0, region.x1, region.y1),
+                    flags=flags)
+        return blk, used_ids
+    blk = Block(kind="table", rows=rows, page=page, confidence=conf,
+                bbox=(region.x0, region.y0, region.x1, region.y1),
+                flags=flags)
+    return blk, used_ids
+
+
+def _table_line_ids(region: TableRegion, lines: List[Line]) -> set:
+    used = set()
+    for ln in lines:
+        if not (region.y0 - 6 <= ln.cy <= region.y1 + 6):
+            continue
+        if ln.x1 < region.x0 - 20 or ln.x0 > region.x1 + 20:
+            continue
+        used.add(id(ln))
+    return used
+
+
+def _table_rows_from_lines(region: TableRegion, lines: List[Line]
+                           ) -> Tuple[List[List[str]], float]:
+    hy, vx = region.hy, region.vx
+    nrows, ncols = len(hy) - 1, len(vx) - 1
     grid = [[[] for _ in range(ncols)] for _ in range(nrows)]
     n_used = 0
     conf = 1.0
@@ -462,11 +579,10 @@ def build_table_block(region: TableRegion, lines: List[Line], page: int
         if ri is None or ci is None:
             continue
         grid[ri][ci].append(ln)
-        used_ids.add(id(ln))
         n_used += 1
         conf = min(conf, ln.conf)
     if n_used < 2:
-        return None, set()
+        return [], 1.0
     rows = []
     for r in grid:
         row = []
@@ -474,12 +590,20 @@ def build_table_block(region: TableRegion, lines: List[Line], page: int
             cell.sort(key=lambda l: (l.y0, l.x0))
             row.append(_join_cell(cluster_rows(cell)) if cell else "")
         rows.append(row)
+    return _clean_table_rows(rows), conf
+
+
+def _clean_table_rows(rows: List[List[str]]) -> List[List[str]]:
     rows = [r for r in rows if any(c.strip() for c in r)]
     if not rows:
-        return None, set()
+        return []
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
     # 丢弃全空的列（底纹色块两条边缘会多出一条假分界线）
-    keep = [j for j in range(len(rows[0])) if any(r[j].strip() for r in rows)]
+    keep = [j for j in range(ncol) if any(r[j].strip() for r in rows)]
     rows = [[r[j] for j in keep] for r in rows]
+    if not rows or not rows[0]:
+        return []
     # 缝合互补的拆裂行：文字骑在网格线上时一行会被拆成上下两半，
     # 仅当两行的非空单元格完全错开时合并（不会误并正常的续行）
     i = 0
@@ -492,9 +616,96 @@ def build_table_block(region: TableRegion, lines: List[Line], page: int
                               for j in range(len(a))]]
         else:
             i += 1
-    blk = Block(kind="table", rows=rows, page=page, confidence=conf,
-                bbox=(0, region.y0, 0, region.y1))
-    return blk, used_ids
+    return rows
+
+
+def _filled_cells(rows: List[List[str]]) -> int:
+    return sum(1 for r in rows for c in r if c.strip())
+
+
+def _has_cross_column_lines(region: TableRegion, lines: List[Line]) -> bool:
+    """Vision 有时会把相邻列识别成同一行，这是表格串列的强信号。"""
+    if len(region.vx) < 3:
+        return False
+    for ln in lines:
+        if not (region.y0 - 5 <= ln.cy <= region.y1 + 5):
+            continue
+        for x in region.vx[1:-1]:
+            if ln.x0 + 6 < x < ln.x1 - 6:
+                return True
+    return False
+
+
+def _should_cell_ocr(region: TableRegion, lines: List[Line],
+                     rows: List[List[str]], score: int) -> bool:
+    nrows, ncols = len(region.hy) - 1, len(region.vx) - 1
+    if nrows * ncols > 160 or ncols > 8:
+        return False
+    if not rows:
+        return True
+    if score >= 2 or _has_cross_column_lines(region, lines):
+        return True
+    # 窄列长文本表格容易把换行串到旁列，宁愿慢一点重扫单元格。
+    col_widths = [region.vx[i + 1] - region.vx[i] for i in range(ncols)]
+    return bool(rows and nrows >= 4 and ncols >= 3 and min(col_widths) < 0.16 * max(region.x1 - region.x0, 1))
+
+
+def _table_rows_from_cell_ocr(provider: StripProvider, region: TableRegion,
+                              bands: Optional[PageBands] = None
+                              ) -> Tuple[List[List[str]], float]:
+    rows: List[List[str]] = []
+    conf = 1.0
+    for i in range(len(region.hy) - 1):
+        y0 = max(0, int(region.hy[i]) + 2)
+        y1 = min(provider.height, int(region.hy[i + 1]) - 2)
+        if y1 - y0 < 8:
+            rows.append([""] * (len(region.vx) - 1))
+            continue
+        strip = provider.get_strip(y0, y1)
+        row = []
+        for j in range(len(region.vx) - 1):
+            x0 = max(0, int(region.vx[j]) + 2)
+            x1 = min(provider.width, int(region.vx[j + 1]) - 2)
+            if x1 - x0 < 10:
+                row.append("")
+                continue
+            cell = strip.crop((x0, 0, x1, strip.height))
+            if not _cell_has_ink(cell):
+                row.append("")
+                continue
+            try:
+                cell_lines = ocr_strip(cell, upscale_to=1800)
+            except Exception:
+                row.append("")
+                conf = min(conf, 0.0)
+                continue
+            cell_lines = [
+                l for l in cell_lines
+                if re.search(r'[0-9A-Za-z一-鿿Σ∑]', l.text)
+                and not is_noise_text(l.text)
+                and not (bands and bands.in_band(y0 + l.cy))
+            ]
+            if not cell_lines:
+                row.append("")
+                continue
+            conf = min(conf, *(l.conf for l in cell_lines))
+            row.append(_join_cell(cluster_rows(cell_lines)))
+        rows.append(row)
+    return _clean_table_rows(rows), conf
+
+
+def _cell_has_ink(img: Image.Image) -> bool:
+    if img.width < 8 or img.height < 8:
+        return False
+    pad_x = min(3, max(0, img.width // 12))
+    pad_y = min(3, max(0, img.height // 12))
+    core = img.crop((pad_x, pad_y, img.width - pad_x, img.height - pad_y))
+    arr = np.asarray(core.convert("L"))
+    if arr.size == 0:
+        return False
+    dark = (arr < 185).mean()
+    mid = ((arr >= 185) & (arr < 235)).mean()
+    return bool(dark > 0.0015 or (dark > 0.0006 and mid > 0.01))
 
 
 def _bucket(v: float, edges: List[int]) -> Optional[int]:
@@ -668,7 +879,7 @@ def assemble_blocks(provider: StripProvider, lines: List[Line], page: int = 0,
     table_blocks = []
     in_table = set()
     for tr in tables:
-        blk, used = build_table_block(tr, lines, page)
+        blk, used = build_table_block(tr, lines, page, provider, bands)
         if blk:
             table_blocks.append(blk)
             in_table |= used
@@ -826,13 +1037,163 @@ def assemble_blocks(provider: StripProvider, lines: List[Line], page: int = 0,
         blocks.append(Block(kind="image", bbox=(0, a, W, b), page=page,
                             text="\n".join(titles + flat), rows=grid))
     for (a, b) in standalone_formula:
+        cap = [l for l in free_lines
+               if a <= l.cy <= b and l.conf >= 0.25
+               and re.search(r'[0-9A-Za-z一-鿿=＝+*/()（）<>≤≥]', l.text)]
+        text = "\n".join(l.text for l in sorted(cap, key=lambda l: (l.y0, l.x0)))
         blocks.append(Block(kind="image", bbox=(0, a, W, b), page=page,
-                            flags=["formula"]))
+                            text=text, flags=["formula"]))
 
     paras = _rows_to_paragraphs(rows, med_h, W, page)
     blocks.extend(paras)
+    blocks = _merge_table_fallback_fragments(blocks, W)
     blocks.sort(key=lambda b: b.bbox[1])
     return blocks, notes
+
+
+def _merge_table_fallback_fragments(blocks: List[Block],
+                                    page_w: float) -> List[Block]:
+    """把紧邻低置信表格截图的表格残片一起保留为截图。
+
+    长截图式 PDF 里，一张逻辑表有时被检测成多个表格区域，中间夹出
+    少量"场景/金额/包括但不限于"之类的残片。如果这些残片仍作为正文
+    输出，阅读者会误以为它们是可信文字；并入截图更保真。
+    """
+    ordered = sorted(blocks, key=lambda b: (b.page, b.bbox[1]))
+    out: List[Block] = []
+    i = 0
+    while i < len(ordered):
+        blk = ordered[i]
+        if not _is_table_fallback_block(blk):
+            out.append(blk)
+            i += 1
+            continue
+
+        run = [blk]
+        saw_fragment = False
+        last = blk
+        j = i + 1
+        while j < len(ordered) and ordered[j].page == blk.page:
+            nxt = ordered[j]
+            gap = nxt.bbox[1] - last.bbox[3]
+            if _is_table_fallback_block(nxt):
+                if gap > 900 and not saw_fragment:
+                    break
+                run.append(nxt)
+                last = nxt
+                j += 1
+                continue
+            if gap <= 1200 and _is_table_fragment_block(nxt):
+                run.append(nxt)
+                saw_fragment = True
+                last = nxt
+                j += 1
+                continue
+            break
+
+        if saw_fragment:
+            x0 = 0
+            y0 = min(b.bbox[1] for b in run)
+            x1 = page_w
+            y1 = max(b.bbox[3] for b in run)
+            flags = ["table_low_confidence", "table_fallback",
+                     "merged_table_fallback"]
+            out.append(Block(kind="image", page=blk.page,
+                             confidence=min(b.confidence for b in run),
+                             bbox=(x0, y0, x1, y1), flags=flags))
+        else:
+            out.append(blk)
+        i = j
+    fallback_refs = [b for b in out if _is_table_fallback_block(b)]
+    final: List[Block] = []
+    for blk in out:
+        if (_is_table_fragment_block(blk)
+                and _near_table_fallback(blk, fallback_refs)
+                and not _is_table_fallback_block(blk)):
+            final.append(Block(kind="image", page=blk.page,
+                               confidence=blk.confidence,
+                               bbox=(0, blk.bbox[1], page_w, blk.bbox[3]),
+                               flags=["table_low_confidence", "table_fallback",
+                                      "fragment_table_fallback"]))
+        else:
+            final.append(blk)
+    return final
+
+
+def _near_table_fallback(blk: Block, refs: List[Block]) -> bool:
+    for ref in refs:
+        if ref.page != blk.page:
+            continue
+        gap = max(ref.bbox[1] - blk.bbox[3], blk.bbox[1] - ref.bbox[3], 0)
+        if gap <= 2400:
+            return True
+    return False
+
+
+def _is_table_fallback_block(blk: Block) -> bool:
+    return blk.kind == "image" and "table_fallback" in blk.flags
+
+
+def _flatten_block_text(blk: Block) -> str:
+    if blk.rows:
+        return " ".join(" ".join(c for c in row if c) for row in blk.rows)
+    return blk.text or ""
+
+
+def _is_table_fragment_block(blk: Block) -> bool:
+    if blk.kind not in ("para", "heading", "table", "image"):
+        return False
+    text = _flatten_block_text(blk).strip()
+    compact = _norm(text)
+    if len(compact) < 4:
+        return False
+    if compact.startswith("案例说明"):
+        return False
+    if blk.kind == "image":
+        return bool((blk.rows and table_suspect_score(blk.rows) >= 2)
+                    or (blk.rows and _table_fragment_signal(text) >= 2)
+                    or _table_fragment_signal(text) >= 3)
+    if blk.kind == "table":
+        rows = blk.rows or []
+        if table_suspect_score(rows) >= 2:
+            return True
+        return bool(re.search(r'场景\s*\d|场景[一二三四五六]', text)
+                    and re.search(r'\d+\s*元\s*/', text))
+
+    score = _table_fragment_signal(text)
+    if blk.kind == "heading" and score < 3:
+        return False
+    return score >= 3
+
+
+def _table_fragment_signal(text: str) -> int:
+    compact = _norm(text)
+    score = 0
+    if re.search(r'\d+\s*元\s*/(?:站|人|项|次|月|天)', text):
+        score += 2
+    if re.search(r'场景\s*\d|场景[一二三四五六]|餐箱|消毒|看板|责任承担|'
+                 r'承担违约|整改|不达标|虚假', text):
+        score += 1
+    if re.search(r'标准站系统|基础建设', text):
+        score += 3
+    if re.search(r'整改不达标|双倍违约金|烟感状态|'
+                 r'功能区|配置|卧室|客厅|承担', text):
+        score += 2
+    if re.search(r'卧室|客厅|站点各功能区|明火|大功率电器|小太阳|'
+                 r'电丝炉|禁止存放', text):
+        score += 2
+    if "烟感状态" in text and "双倍违约金" in text:
+        score += 2
+    if "包括但不限于" in text:
+        score += 2
+    if looks_truncated(text):
+        score += 1
+    if re.match(r'^\d{1,2}[.．]\s*包括但不限于', text):
+        score += 3
+    if re.search(r'\d{3,5}\s*$', compact) and re.search(
+            r'审核|判定|处置|提交|违约|承担', compact):
+        score += 2
+    return score
 
 
 def _rows_to_paragraphs(rows: List[List[Line]], med_h: float, page_w: float,
