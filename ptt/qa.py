@@ -16,8 +16,9 @@ _CLEAN_SECTION_HEADING = re.compile(
     r'^[一二三四五六七八九十]{1,3}[、.．]\s*'
     r'[0-9A-Za-z一-鿿（）()《》【】\s/-]{2,24}[.．。…⋯]?$')
 _CLEAN_FORM_FIELD = re.compile(r'^\d{1,2}[.．]\s*站点ID[:：]\s*_?站点名称$')
-# 数学公式信号：OCR 处理分式/上下标很不可靠，这类低置信块直接截图
+# 数学公式信号：低置信且属于视觉公式时转入公式块；纯文本公式保留文本。
 _MATH_RE = re.compile(r'[=≤≥×÷√∑∏∝≈≠＋＝]|[+*/^]\s*\d|\d\s*[+*/]')
+_TEXT_FORMULA_RE = re.compile(r'^[\u4e00-\u9fffA-Za-z0-9（）()、/+＋*× _{}]+[=＝].{2,}$')
 _WATERMARK_IN_TEXT = re.compile(
     r'(?i)(?:bm[_\\-]*ch|chenj|chenjia|i?ang[o0]l|cheny|陈加强|陈加\d?)')
 _SUSPECT_OCR_TEXT = re.compile(r'[�俁仴雲抇讳冏昇銷埃門哭伿怯奂]')
@@ -114,6 +115,10 @@ def image_fallback(blocks: List[Block], provider: StripProvider
     def flush_group():
         if not group:
             return
+        if _looks_like_multiline_text_formula("\n".join(b.text for b in group if b.text)):
+            out.extend(group)
+            group.clear()
+            return
         single = len(group) == 1
         if single and not _should_image_fallback_single(group[0]):
             out.extend(group)
@@ -203,13 +208,67 @@ def _is_pure_noise_text(text: str) -> bool:
 def _should_image_fallback_single(blk: Block) -> bool:
     text = blk.text or ""
     compact = re.sub(r'\s+', '', text)
-    if _MATH_RE.search(text) or garbled_score(text) > 0:
+    if _looks_like_text_formula(text):
+        return False
+    if _MATH_RE.search(text) and not _looks_like_text_formula(text):
+        return True
+    if garbled_score(text) > 0:
         return True
     if _SUSPECT_OCR_TEXT.search(text):
         return True
     if _contains_watermark_noise(text):
         return True
     if blk.confidence <= 0.35 and len(compact) >= 18:
+        return True
+    return False
+
+
+def _looks_like_text_formula(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if not s or "\n" in (text or ""):
+        return False
+    if not _TEXT_FORMULA_RE.match(s):
+        return False
+    if re.search(r"SUM|Σ|sqrt|\\frac|[上下]标", s, re.I):
+        return False
+    if len(re.findall(r"[=＝]", s)) > 1:
+        return False
+    # Plain business/rule formulas read left-to-right; dense variable-only
+    # expressions are more likely to need LaTeX handling.
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", s))
+    return chinese >= 4 and len(s) <= 160
+
+
+def _looks_like_multiline_text_formula(text: str) -> bool:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines or len(lines) > 4:
+        return False
+    compact = re.sub(r'\s+', '', "".join(lines))
+    if len(compact) > 220 or len(compact) < 10:
+        return False
+    if len(re.findall(r"[=＝]", compact)) != 1:
+        return False
+    if re.search(r"SUM|Σ|\\frac|_\{|[A-Za-z]\s*/\s*[A-Za-z]", compact, re.I):
+        return False
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", compact))
+    if chinese < 8:
+        return False
+    return bool(re.search(r"[+＋]", compact))
+
+
+def _is_safe_low_confidence_formula(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if not s:
+        return False
+    if _looks_like_text_formula(text) or _looks_like_multiline_text_formula(text):
+        return True
+    # Long left-to-right scoring expressions are often low-confidence because
+    # OCR sees dense symbols, but they are still readable text formulas rather
+    # than visual fractions that require review.
+    if ("得分" in s and "权重" in s and re.search(r"W[1-4]", s)
+            and re.search(r"[=＝]", s)):
+        return True
+    if re.search(r"\d+%[*×]\d+", s) and re.search(r"[=＝]\d", s):
         return True
     return False
 
@@ -306,6 +365,8 @@ def qa_scan(blocks: List[Block]) -> Tuple[List[str], int]:
                 if "garbled" not in blk.flags:
                     blk.flags.append("garbled")
         if "low_confidence" in blk.flags:
+            if _is_safe_low_confidence_formula(blk.text or ""):
+                continue
             n_flag += 1
             issues.append(f"块{i} 低置信度({blk.confidence:.2f}): "
                           f"{(blk.text or '')[:40]}")

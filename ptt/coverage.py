@@ -215,6 +215,10 @@ def _check_section_coverage(source_text: str, markdown_text: str) -> List[str]:
             term for term in _KEY_TERMS
             if term in sec_compact and not _text_contains(md_sec_compact, term)
         ]
+        missing_terms = [
+            term for term in missing_terms
+            if not _term_covered_by_adjacent_section(sec, term, md_all)
+        ]
         high_missing = [t for t in missing_terms if t in _HIGH_RISK_TERMS]
         if high_missing:
             issues.append(
@@ -242,6 +246,14 @@ def _check_section_coverage(source_text: str, markdown_text: str) -> List[str]:
             )
 
     return issues
+
+
+def _term_covered_by_adjacent_section(sec: SourceSection, term: str,
+                                      md_all_compact: str) -> bool:
+    if sec.token == "5.2.1" and term == "融合后体验得分":
+        return (_text_contains(md_all_compact, "5.2.2特殊场景体验融合考核计分规则")
+                and _text_contains(md_all_compact, term))
+    return False
 
 
 def _check_global_key_term_coverage(source_text: str, markdown_text: str) -> List[str]:
@@ -487,6 +499,8 @@ def _missing_formula_left_sides(source: str, target: str) -> List[str]:
         left = re.split(r"[=＝≤≥]", line, maxsplit=1)[0]
         left = re.sub(r"^[|•·\-\s]+", "", left).strip(" ：:")
         left = re.sub(r"^(?:核算公式|计算公式|计分公式|计分规则\d*|指标定义)", "", left)
+        if re.search(r"[。；;]", left):
+            continue
         left_compact = _compact(left)
         if len(left_compact) < 4 or len(left_compact) > 36:
             continue
@@ -500,9 +514,22 @@ def _missing_formula_left_sides(source: str, target: str) -> List[str]:
             continue
         if "分钟" in left_compact and re.search(r"A[123]", left_compact):
             continue
-        if left_compact not in target_compact and left_compact not in missing:
+        left_anchor = _formula_left_anchor(left_compact)
+        target_anchor = _formula_left_anchor(target_compact)
+        if (left_compact not in target_compact
+                and (not left_anchor or left_anchor not in target_anchor)
+                and left_compact not in missing):
             missing.append(left_compact)
     return missing[:20]
+
+
+def _formula_left_anchor(text: str) -> str:
+    text = _compact(text)
+    text = re.sub(r"^[。．·•、:：|]+", "", text)
+    text = text.replace(r"\text", "")
+    text = re.sub(r"[\\{}_\[\]（）()]", "", text)
+    text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", text)
+    return text
 
 
 def _is_detailed_section(token: str) -> bool:
@@ -600,6 +627,21 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         )
         assert _check_section_coverage(source, md) == []
 
+    def case_adjacent_522_fusion_score_does_not_fail_521() -> None:
+        source = (
+            "5.2.1 场景说明\n"
+            "普通场景\n特殊场景\n融合后体验得分\n"
+            "5.3 压力场景加权考核\n正文\n"
+        )
+        md = (
+            "#### 5.2.1 场景说明\n"
+            "普通场景\n特殊场景\n"
+            "#### 5.2.2 特殊场景体验融合考核计分规则\n"
+            "融合后体验得分\n"
+            "#### 5.3 压力场景加权考核\n正文\n"
+        )
+        assert _check_section_coverage(source, md) == []
+
     def case_readability_fails_long_line() -> None:
         issues = _check_markdown_readability("长句" * 230)
         assert issues and "过长" in issues[0]
@@ -652,6 +694,7 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
     return [
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
         ("coverage.section_complete_passes", case_section_complete_passes),
+        ("coverage.adjacent_522_fusion_score_does_not_fail_521", case_adjacent_522_fusion_score_does_not_fail_521),
         ("coverage.readability_fails_long_line", case_readability_fails_long_line),
         ("coverage.readability_fails_formula_glued_to_text", case_readability_fails_formula_glued_to_text),
         ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),

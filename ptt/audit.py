@@ -50,7 +50,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
 	        r"谢味\s*恕|特妹|特珠|特株|场意|算分不例|多倍权甫|权甫|"
 	        r"300[,，zZ]|70046|级力\s*\d+|240天气|≤22|配送原因未完成率=Y2|XI|Xe|Yz|Zs|"
             r"张冢口|品陳|品陈|"
-	        r"结算方案[）)]|KA星级结算金|KA星级结\b|K[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS]|"
+	        r"结算方案[）)]|KA星级结\b|K[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS]|"
         r"K[iI]分\s*[、,，]\s*K[aA]分|K[.．]{2}K[aA]|K[Ii]分|"
         r"K[sS]分K[Nn]分|Q1\s*[.．]\s*Q2")),
     ("表格结构可读性问题", re.compile(
@@ -383,6 +383,14 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
             result = scan_markdown(path)
         _assert_equal(result["issue_count"], 0, "issue_count")
 
+    def case_ka_star_settlement_amount_allowed() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("商服务费 = 基础服务费 + KA星级结算金额 + KA体验膨胀费\n")
+            result = scan_markdown(path)
+        _assert_equal(result["issue_count"], 0, "issue_count")
+
     def case_formula_review_marker_blocks_pass() -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.md")
@@ -501,6 +509,7 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("audit.salary_policy_residuals", case_salary_policy_residuals),
         ("audit.normal_formula_not_zero_reversal", case_normal_formula_not_zero_reversal),
         ("audit.normal_y2_variable_allowed", case_normal_y2_variable_allowed),
+        ("audit.ka_star_settlement_amount_allowed", case_ka_star_settlement_amount_allowed),
         ("audit.formula_review_marker_blocks_pass", case_formula_review_marker_blocks_pass),
         ("audit.convert_outputs_single_md_without_assets_or_layout", case_convert_outputs_single_md_without_assets_or_layout),
         ("audit.critical_sections_missing", case_critical_sections_missing),

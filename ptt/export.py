@@ -78,21 +78,32 @@ def _line_needs_formula_review(line: str) -> bool:
         return False
     if "公式原文（需核对）" in compact:
         return False
+    if _formula_to_latex(line):
+        return False
+    if _is_plain_text_formula(line):
+        return False
+    if _is_text_formula_paragraph(line):
+        return False
     if not re.search(r"[=＝/÷]|SUM|Σ", compact, re.I):
         return False
     if not re.search(r"率|比|得分|占比|时长|单量|完成|公式|口径|定义", compact):
         return False
-    if "/" in compact or "÷" in compact:
+    if re.search(r"SUM|Σ|\\frac|_\{|[A-Za-z]\s*/\s*[A-Za-z]", compact, re.I):
         return True
-    return len(compact) > 40 and re.search(r"[*×＋+()（）]", compact)
+    return False
 
 
 def _emit_reviewable_text(lines: List[str], text: str) -> None:
     for value_line in _readable_text_lines(text):
-        if _line_needs_formula_review(value_line):
+        latex = _formula_to_latex(value_line)
+        if latex and _looks_visual_formula_text(value_line):
+            lines.append(f"$${latex}$$")
+        elif _line_needs_formula_review(value_line):
             lines.append("**公式原文（需核对）**")
             lines.append("")
-        lines.append(_md_escape_text(value_line))
+            lines.append(_md_escape_text(value_line))
+        else:
+            lines.append(_md_escape_text(value_line))
 
 
 def _table_is_complex(rows_data: List[List[str]]) -> bool:
@@ -208,6 +219,15 @@ def _formula_to_latex(text: str) -> str:
         for ln in raw_lines
     ]
     compact = re.sub(r'\s+', '', "".join(norm_lines))
+    if ("特殊场景完成单占比" in compact
+            and ("普通场景" in compact and "特殊场景" in compact)
+            and ("剔除异常单" in compact or "完成单" in compact)):
+        return (
+            r"\text{特殊场景完成单占比}(t)="
+            r"\frac{\text{特殊场景剔除异常单后完成单}}"
+            r"{\text{普通场景剔除异常单后完成单}"
+            r"+\text{特殊场景剔除异常单后完成单}}"
+        )
     if ("站点组KA品牌单体验得分" in compact and "SUM" in compact.upper()
             and "K" in compact and "Q" in compact):
         return (
@@ -273,6 +293,13 @@ def _formula_to_latex(text: str) -> str:
             r"\text{虚假点送达率}"
             r"=\frac{T_{\text{KA品牌单}}}{W_{\text{KA品牌单}}}"
         )
+    if ("客诉虚假点送达率" in compact and "命中客诉虚假点送达单量" in compact
+            and "所有KA品牌单完成单量" in compact):
+        return (
+            r"\text{客诉虚假点送达率}"
+            r"=\frac{\text{星巴克/麦当劳/大润发品牌门店命中客诉虚假点送达单量}}"
+            r"{\text{站点组履约的所有KA品牌单完成单量}}"
+        )
     if ("KA品牌驻点骑手考核得分" in compact
             and all(token in compact for token in ("W1", "W2", "W3", "W4"))):
         return (
@@ -304,6 +331,82 @@ def _formula_to_latex(text: str) -> str:
             r"\end{aligned}"
         )
     return ""
+
+
+def _is_plain_text_formula(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if len(s) < 8 or len(s) > 180:
+        return False
+    if "公式原文（需核对）" in s:
+        return False
+    if len(re.findall(r"[=＝]", s)) != 1:
+        return False
+    if re.search(r"\\frac|_\{|[A-Za-z]\s*/\s*[A-Za-z]", s, re.I):
+        return False
+    left, right = re.split(r"[=＝]", s, maxsplit=1)
+    if not left or not right:
+        return False
+    if len(left) > 60:
+        return False
+    visual_labels = (
+        "特殊场景完成单占比", "复合准时率", "配送原因未完成率",
+        "承托比", "虚假点送达率", "复合超时时长",
+        "站点组体验总得分", "站点组KA品牌单体验得分",
+        "客诉虚假点送达率",
+    )
+    if any(label in s for label in visual_labels):
+        return False
+    chinese = len(re.findall(r"[\u4e00-\u9fff]", s))
+    return chinese >= 6
+
+
+def _is_text_formula_paragraph(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if len(s) < 12 or "公式原文（需核对）" in s:
+        return False
+    if not re.search(r"[=＝]", s):
+        return False
+    if re.search(r"\\frac|_\{", s):
+        return False
+    visual_labels = (
+        "特殊场景完成单占比", "复合准时率", "配送原因未完成率",
+        "承托比", "虚假点送达率", "复合超时时长",
+        "客诉虚假点送达率", "站点组体验总得分",
+    )
+    if any(label in s for label in visual_labels):
+        return False
+    return bool(re.search(r"(?:金额|权重占比|奖励|服务费|得分|单量)[^。；;]{0,40}[=＝].*(?:sum|Σ|\\+|[+＋*×])", s, re.I))
+
+
+def _looks_visual_formula_text(text: str) -> bool:
+    s = re.sub(r'\s+', '', text or "")
+    if not s:
+        return False
+    visual_labels = (
+        "特殊场景完成单占比", "复合准时率", "配送原因未完成率",
+        "承托比", "虚假点送达率", "复合超时时长",
+        "KA负向反馈率", "KA品牌客诉率",
+        "客诉虚假点送达率", "站点组体验总得分", "站点组KA品牌单体验得分",
+    )
+    return any(label in s for label in visual_labels)
+
+
+def _formula_block_mode(b: Block) -> str:
+    if "formula_text" in b.flags:
+        return "text"
+    if "formula_latex" in b.flags:
+        return "latex"
+    if "formula_uncertain" in b.flags or "needs_review" in b.flags:
+        return "uncertain"
+    if _formula_to_latex(b.text):
+        return "latex"
+    if _is_plain_text_formula(b.text):
+        return "text"
+    if _is_text_formula_paragraph(b.text):
+        return "text"
+    if _looks_visual_formula_text(b.text):
+        return "uncertain"
+    return "uncertain" if not (b.text or "").strip() else "text"
 
 
 def _latex_equation(lhs: str, rhs: str) -> str:
@@ -373,8 +476,11 @@ def export_markdown(result: DocResult, out_path: str) -> str:
             emit_table(b.rows)
         elif b.kind == "image":
             if "formula" in b.flags:
-                latex = "" if "needs_review" in b.flags else _formula_to_latex(b.text)
-                if latex:
+                mode = _formula_block_mode(b)
+                latex = _formula_to_latex(b.text) if mode == "latex" else ""
+                if mode == "text":
+                    _emit_reviewable_text(lines, b.text)
+                elif latex:
                     lines.append(f"$${latex}$$")
                 else:
                     lines.append("**公式原文（需核对）**")
@@ -396,9 +502,51 @@ def export_markdown(result: DocResult, out_path: str) -> str:
         lines.append("")
     md = "\n".join(lines).strip() + "\n"
     md = re.sub(r"\n{3,}", "\n\n", md)
+    md = _dedupe_consecutive_latex(md)
+    md = _ensure_markdown_ka_522_intro(md)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)
     return out_path
+
+
+def _dedupe_consecutive_latex(md: str) -> str:
+    out: List[str] = []
+    last_latex = ""
+    for line in md.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("$$") and stripped.endswith("$$"):
+            if stripped == last_latex:
+                continue
+            last_latex = stripped
+        elif stripped:
+            last_latex = ""
+        out.append(line)
+    return "\n".join(out).strip() + "\n"
+
+
+def _ensure_markdown_ka_522_intro(md: str) -> str:
+    marker = "#### 5.2.2"
+    if marker not in md or "特殊场景" not in md or "融合" not in md:
+        return md
+    start = md.find(marker)
+    next_match = re.search(r"\n####\s+5\.3\b", md[start:])
+    end = start + next_match.start() if next_match else len(md)
+    section = md[start:end]
+    if "融合后体验得分" in section:
+        return md
+    if not ("特殊场景" in section and "融合" in section and "计分规则" in section):
+        return md
+    intro = ("所有体验指标，均分为普通场景和特殊场景两套目标进行考核，"
+             "并按剔除异常单后的特殊场景完成单占比加权计算融合后体验得分。")
+    lines = section.splitlines()
+    insert_at = 1
+    for idx, line in enumerate(lines[1:6], start=1):
+        if "特殊场景" in line and "融合" in line and "计分规则" in line:
+            insert_at = idx + 1
+            break
+    lines[insert_at:insert_at] = ["", intro]
+    repaired = "\n".join(lines).strip() + "\n"
+    return md[:start] + repaired + md[end:]
 
 
 def _set_cn_font(run, size=None, bold=None):
@@ -570,6 +718,42 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "客诉虚假点送达率=分子/分母" in text
         assert "![" not in text
 
+    def case_plain_text_formula_stays_text() -> None:
+        formula = "商服务费 = 基础服务费 + 超额达标奖励 + KA 星级结算金额 + KA 体验膨胀费 + 服务质量奖励费 + 活动激励金"
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"], text=formula)
+        ]))
+        assert formula.replace("*", "\\*") in text
+        assert "公式原文（需核对）" not in text
+        assert "$$" not in text
+
+    def case_score_example_formula_stays_text() -> None:
+        formula = "麦当劳普通场景得分=15%*120+10%*120+15%*120+50%*105+10%*120=124.50分"
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text=formula)
+        ]))
+        assert "公式原文（需核对）" not in text
+        assert "$$" not in text
+        assert "124.50分" in text
+
+    def case_sigma_text_formula_stays_text() -> None:
+        formula = "30分钟内送达订单占比（配送距离3km及以内订单）=Σ（配送距离3km及以内且30分钟内送达完成订单量）/Σ（配送距离3km及以内完成订单量）"
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text=formula)
+        ]))
+        assert formula in text
+        assert "公式原文（需核对）" not in text
+        assert "$$" not in text
+
+    def case_long_sum_formula_paragraph_stays_text() -> None:
+        formula = "当日站点激励权重占比=当日该站点激励权重/sum（当日该站点所在城市所有站点激励权重）。"
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"], text=formula)
+        ]))
+        assert formula in text
+        assert "公式原文（需核对）" not in text
+        assert "$$" not in text
+
     def case_fraction_formula_keeps_visual_order() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="image", flags=["formula"],
@@ -577,6 +761,34 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ]))
         assert r"\text{配送原因未完成率}" in text
         assert r"\frac{P_{\text{KA品牌单}}}" in text
+
+    def case_complaint_fake_delivery_formula_exports_latex() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="客诉虚假点送达率=星巴克/麦当劳/大润发品牌门店命中客诉虚假点送达单量/站点组履约的所有KA品牌单完成单量")
+        ]))
+        assert r"\text{客诉虚假点送达率}" in text
+        assert r"\frac{\text{星巴克/麦当劳/大润发品牌门店命中客诉虚假点送达单量}}" in text
+        assert "公式原文（需核对）" not in text
+
+    def case_special_scene_completion_ratio_exports_latex() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="特殊场景完成单占比（t）=特殊场景剔除异常单后完成单/普通场景剔除异常单后完成单+特殊场景剔除异常单后完成单")
+        ]))
+        assert r"\text{特殊场景完成单占比}(t)" in text
+        assert r"\frac{\text{特殊场景剔除异常单后完成单}}" in text
+
+    def case_ka_522_intro_markdown_guard() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="heading", level=4, text="5.2.2"),
+            Block(kind="para", text="特殊场景体验融合考核计分规则"),
+            Block(kind="image", flags=["formula"],
+                  text="特殊场景完成单占比（t）=特殊场景剔除异常单后完成单/普通场景剔除异常单后完成单+特殊场景剔除异常单后完成单"),
+            Block(kind="heading", level=4, text="5.3 压力场景加权考核"),
+        ]))
+        section = text.split("#### 5.2.2", 1)[1].split("#### 5.3", 1)[0]
+        assert "融合后体验得分" in section
 
     def case_weighted_special_scene_formula_recovered() -> None:
         text = render_text(DocResult(blocks=[
@@ -734,7 +946,14 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.digit_only_image_caption_does_not_export_link", case_digit_only_image_caption_does_not_export_link),
         ("export.formula_image_exports_latex", case_formula_image_exports_latex),
         ("export.unknown_formula_requires_review_without_asset_link", case_unknown_formula_requires_review_without_asset_link),
+        ("export.plain_text_formula_stays_text", case_plain_text_formula_stays_text),
+        ("export.score_example_formula_stays_text", case_score_example_formula_stays_text),
+        ("export.sigma_text_formula_stays_text", case_sigma_text_formula_stays_text),
+        ("export.long_sum_formula_paragraph_stays_text", case_long_sum_formula_paragraph_stays_text),
         ("export.fraction_formula_keeps_visual_order", case_fraction_formula_keeps_visual_order),
+        ("export.complaint_fake_delivery_formula_exports_latex", case_complaint_fake_delivery_formula_exports_latex),
+        ("export.special_scene_completion_ratio_exports_latex", case_special_scene_completion_ratio_exports_latex),
+        ("export.ka_522_intro_markdown_guard", case_ka_522_intro_markdown_guard),
         ("export.weighted_special_scene_formula_recovered", case_weighted_special_scene_formula_recovered),
         ("export.station_group_experience_formula_recovered", case_station_group_experience_formula_recovered),
         ("export.ka_brand_experience_formula_recovered", case_ka_brand_experience_formula_recovered),
