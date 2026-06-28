@@ -1,7 +1,7 @@
 """导出：Block 列表 -> Markdown / Word(.docx)。"""
 import os
 import re
-from typing import List
+from typing import Callable, List
 
 from .models import Block, DocResult
 
@@ -18,7 +18,117 @@ def _md_escape_text(s: str) -> str:
 
 
 def _md_escape_cell(s: str) -> str:
-    return _md_escape_text(s).replace("|", "\\|").replace("\n", "<br>")
+    clean = re.sub(r'\s*\n+\s*', "；", s.strip())
+    return _md_escape_text(clean).replace("|", "\\|")
+
+
+def _split_long_text_line(line: str, limit: int = 180) -> List[str]:
+    if len(line) <= limit:
+        return [line]
+    pieces = re.split(r'([。；;，、+＋])', line)
+    chunks: List[str] = []
+    chunk = ""
+    for piece in pieces:
+        if not piece:
+            continue
+        next_chunk = chunk + piece
+        if chunk and len(next_chunk) > limit:
+            chunks.append(chunk.strip())
+            chunk = piece.lstrip()
+        else:
+            chunk = next_chunk
+    if chunk.strip():
+        chunks.append(chunk.strip())
+    if len(chunks) <= 1:
+        chunks = [line[i:i + limit] for i in range(0, len(line), limit)]
+    return [c for c in chunks if c]
+
+
+def _readable_text_lines(text: str) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    text = re.sub(r'\s*<br\s*/?>\s*', "\n", text, flags=re.I)
+    text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|指标定义\d*[:：]|计算公式[:：]))',
+                  "\n", text)
+    text = re.sub(r'(?<!^)(?=(?:麦当劳|肯德基|必胜客)完单量占比=)', "\n", text)
+    text = re.sub(r'(?<!^)(?=30分钟内送达订单占比（)', "\n", text)
+    text = re.sub(r'(?<!^)(?=品牌方口径准时率（)', "\n", text)
+    out: List[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        out.extend(_split_long_text_line(line))
+    return out
+
+
+def _table_is_complex(rows_data: List[List[str]]) -> bool:
+    if not rows_data:
+        return False
+    ncol = max(len(r) for r in rows_data)
+    padded = [r + [""] * (ncol - len(r)) for r in rows_data]
+    if ncol > 5:
+        return True
+    if any("\n" in c or "<br" in c.lower() for r in padded for c in r):
+        return True
+    if any(len(c) > 90 for r in padded for c in r):
+        return True
+    if ncol >= 3 and any(not r[0].strip() for r in padded[1:]):
+        return True
+    return False
+
+
+def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
+    ncol = max(len(r) for r in rows_data)
+    rows = [r + [""] * (ncol - len(r)) for r in rows_data]
+    header = [c.strip() for c in rows[0]]
+    body = rows[1:] if len(rows) > 1 else rows
+
+    two_col = ncol == 2 and (
+        header[0] in ("项目", "指标", "类型", "要求", "维度")
+        or header[1] in ("内容", "说明", "数值", "得分")
+    )
+    if two_col:
+        for key, value in body:
+            key = key.strip()
+            value_lines = _readable_text_lines(value)
+            if not key and not value_lines:
+                continue
+            if key:
+                lines.append(f"**{_md_escape_text(key)}**")
+                lines.append("")
+            for value_line in value_lines:
+                lines.append(_md_escape_text(value_line))
+            lines.append("")
+        return
+
+    if any(c for c in header):
+        lines.append("**" + _md_escape_text(" / ".join(c for c in header if c)) + "**")
+        lines.append("")
+    for row in body:
+        pairs = []
+        for idx, cell in enumerate(row):
+            cell = cell.strip()
+            if not cell:
+                continue
+            label = header[idx] if idx < len(header) and header[idx] else f"列{idx + 1}"
+            value_lines = _readable_text_lines(cell) or [cell]
+            pairs.append((label, value_lines))
+        if pairs:
+            one_line = "；".join(f"{label}：{'；'.join(value_lines)}"
+                                 for label, value_lines in pairs)
+            if len(one_line) <= 220:
+                lines.append("- " + _md_escape_text(one_line))
+            else:
+                first = True
+                for label, value_lines in pairs:
+                    for pos, value_line in enumerate(value_lines):
+                        prefix = "- " if first else "  "
+                        label_text = f"{label}：" if pos == 0 else ""
+                        lines.append(prefix + _md_escape_text(label_text + value_line))
+                        first = False
+    lines.append("")
 
 
 def _formula_to_latex(text: str) -> str:
@@ -183,6 +293,9 @@ def export_markdown(result: DocResult, out_path: str) -> str:
     lines: List[str] = []
     title = result.meta.get("title")
     def emit_table(rows_data):
+        if _table_is_complex(rows_data):
+            _emit_readable_table(lines, rows_data)
+            return
         ncol = max(len(r) for r in rows_data)
         rows = [r + [""] * (ncol - len(r)) for r in rows_data]
         lines.append("| " + " | ".join(_md_escape_cell(c) for c in rows[0]) + " |")
@@ -195,7 +308,11 @@ def export_markdown(result: DocResult, out_path: str) -> str:
             lines.append("#" * max(1, min(b.level or 1, 6)) + " "
                          + _md_escape_text(b.text))
         elif b.kind == "para":
-            lines.append(_md_escape_text(b.text))
+            para_lines = _readable_text_lines(b.text)
+            if len(para_lines) > 1:
+                lines.extend(_md_escape_text(ln) for ln in para_lines)
+            else:
+                lines.append(_md_escape_text(b.text))
         elif b.kind == "table" and b.rows:
             emit_table(b.rows)
         elif b.kind == "image":
@@ -337,3 +454,146 @@ def export_docx(result: DocResult, out_path: str) -> str:
                 _set_cn_font(p.add_run(f"[图片: {os.path.basename(b.image_path)}]"))
     doc.save(out_path)
     return out_path
+
+
+def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
+    import tempfile
+
+    def render_text(result: DocResult) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            out_path = os.path.join(td, "out.md")
+            export_markdown(result, out_path)
+            with open(out_path, "r", encoding="utf-8") as f:
+                return f.read()
+
+    def case_unreliable_image_caption_does_not_export_link() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(
+                kind="image",
+                image_path="fig.png",
+                text="1\n二、适用区域⋯… 1三、定义/名词解释. 2",
+            )
+        ]))
+        assert "![图片]" not in text
+        assert "图中文字" not in text
+        assert "\n1\n" not in text
+        assert text.strip() == ""
+
+    def case_digit_only_image_caption_does_not_export_link() -> None:
+        text = render_text(DocResult(blocks=[Block(kind="image", image_path="fig.png", text="1")]))
+        assert "![图片]" not in text
+        assert "图中文字" not in text
+        assert "\n1\n" not in text
+        assert text.strip() == ""
+
+    def case_formula_image_exports_latex() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"], text="复合超时时长 =\nA1 + A2 + A3\nW")
+        ]))
+        assert "$$" in text
+        assert r"\text{复合超时时长} = \frac{A1 + A2 + A3}{W}" in text
+        assert "![公式]" not in text
+
+    def case_fraction_formula_keeps_visual_order() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"], text="P\n配送原因未完成率 =\nW+P")
+        ]))
+        assert r"\text{配送原因未完成率} = \frac{P}{W+P}" in text
+
+    def case_weighted_special_scene_formula_recovered() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="加权后特殊场景完成单加权后特珠场景完成单占比(D二元权后普通场紫完成单＋加权后特珠场景完成单常规计分项得分=加权后特殊场景得分*t＋加权后普通场景得分*(1-t)")
+        ]))
+        assert r"\text{加权后特殊场景完成单占比}(t)" in text
+        assert r"\text{常规计分项得分}" in text
+        assert r"\frac{\text{加权后特殊场景完成单}}" in text
+
+    def case_station_group_experience_formula_recovered() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="站点组体验总得分=站点组F分*F/(F+SUM(Kn*Qn))+站点组Kn分*(Kn*Qn)/(F+SUM(Kn*Qn))")
+        ]))
+        assert r"\text{站点组体验总得分}" in text
+        assert r"\mathrm{SUM}(K_n\times Q_n)" in text
+        assert r"\text{站点组}K_n\text{分}" in text
+
+    def case_ka_brand_experience_formula_recovered() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="站点组KA品牌单体验得分=K1分*K1*Q1/SUM(Kn*Qn)+KN分*KN*QN/SUM(Kn*Qn)")
+        ]))
+        assert r"\text{站点组KA品牌单体验得分}" in text
+        assert r"K_1\text{分}\times\frac{K_1\times Q_1}" in text
+        assert r"K_n\text{分}\times\frac{K_n\times Q_n}" in text
+
+    def case_ka_weighted_example_formula_keeps_numbers() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="A履约的体验总得分为118*(10000/(10000+700*6+300,z))+120*(700*6/(10000+70046+300,z))+115*(300,z/(10000+700*6+300,z))=118.4459分")
+        ]))
+        assert r"10000+700\times6+300\times2" in text
+        assert r"115\times\frac{300\times2}" in text
+        assert "300,z" not in text
+
+    def case_ka_formula_recovery() -> None:
+        punctuality = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="复合准时率（考核）=1-(C KA品牌单+5*Y KA品牌单)/W KA品牌单")
+        ]))
+        delivery = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="配送原因未完成率=P KA品牌单/(W KA品牌单+P KA品牌单)")
+        ]))
+        rider = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="计分规则 KA 品牌驻点骑手考核得分=W1得分*W1权重+W2得分*W2权重+W3得分*W3权重+W4得分*W4权重其中")
+        ]))
+        overtime = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["formula"],
+                  text="复合超时时长=(A1_{KA品牌单}+A2_{KA品牌单}+A3_{KA品牌单})/W_{KA品牌单}")
+        ]))
+        assert r"C_{\text{KA品牌单}}+5\times Y_{\text{KA品牌单}}" in punctuality
+        assert r"\frac{P_{\text{KA品牌单}}}" in delivery
+        assert r"W1\text{得分}\times W1\text{权重}" in rider
+        assert r"\frac{A1_{\text{KA品牌单}}+A2_{\text{KA品牌单}}+A3_{\text{KA品牌单}}}" in overtime
+
+    def case_textual_image_table_exports_table_without_link() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", flags=["table_fallback"], rows=[["指标", "值"], ["A", "1"]])
+        ]))
+        assert "| 指标 | 值 |" in text
+        assert "![表格截图]" not in text
+
+    def case_complex_table_exports_readable_blocks_without_br() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["项目", "内容"],
+                ["指标定义1",
+                 "【完成订单量】通过美团配送且订单最终状态为完成的订单数量。\n"
+                 "麦当劳完单量占比=麦当劳完单量/总量\n"
+                 "注：数据来源均为品牌方。"],
+            ]),
+            Block(kind="table", rows=[
+                ["指标", "分子数值", "分母数值", "达标率（值）", "满分目标", "权重", "得分"],
+                ["KA品牌负向反馈率", "2单", "100", "2%", "0.01%", "15%", "0"],
+            ]),
+        ]))
+        assert "<br>" not in text
+        assert "**指标定义1**" in text
+        assert "麦当劳完单量占比=麦当劳完单量/总量" in text
+        assert "- 指标：KA品牌负向反馈率" in text
+
+    return [
+        ("export.unreliable_image_caption_does_not_export_link", case_unreliable_image_caption_does_not_export_link),
+        ("export.digit_only_image_caption_does_not_export_link", case_digit_only_image_caption_does_not_export_link),
+        ("export.formula_image_exports_latex", case_formula_image_exports_latex),
+        ("export.fraction_formula_keeps_visual_order", case_fraction_formula_keeps_visual_order),
+        ("export.weighted_special_scene_formula_recovered", case_weighted_special_scene_formula_recovered),
+        ("export.station_group_experience_formula_recovered", case_station_group_experience_formula_recovered),
+        ("export.ka_brand_experience_formula_recovered", case_ka_brand_experience_formula_recovered),
+        ("export.ka_weighted_example_formula_keeps_numbers", case_ka_weighted_example_formula_keeps_numbers),
+        ("export.ka_formula_recovery", case_ka_formula_recovery),
+        ("export.textual_image_table_exports_table_without_link", case_textual_image_table_exports_table_without_link),
+        ("export.complex_table_exports_readable_blocks_without_br", case_complex_table_exports_readable_blocks_without_br),
+    ]

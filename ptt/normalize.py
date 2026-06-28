@@ -4,7 +4,7 @@
 """
 import re
 from collections import Counter
-from typing import Iterable, List, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 from .models import Block
 
@@ -450,6 +450,7 @@ def _repair_ka_readability_layouts(blocks: List[Block],
     _repair_ka_overtime_example_layout(blocks, counter)
     _repair_ka_score_threshold_layout(blocks, counter)
     _repair_ka_rider_score_rule_layout(blocks, counter)
+    _repair_ka_special_scene_fusion_layout(blocks, counter)
 
 
 def _ensure_ka_overtime_formula(blocks: List[Block],
@@ -687,6 +688,121 @@ def _ka_rider_appeal_rows() -> List[List[str]]:
          "微笑行动抽查不合格非本人、上线验真有单非本人、站长点上线有单未验真、专送同轨迹&一机多号、专快送同轨迹&一机多号、异常改派点送达、督导检核、骑手身份虚假、声纹识别非本人等判定为非有效骑手，具体运力虚假判定规则与诚信考核中虚假骑手定义保持一致。"],
         ["补充说明",
          "本考核方案的KA品牌驻点骑手得分最终只应用于KA品牌单体验考核得分计算，是否属于同配送区同商情况以考核周期最后一天状态为准。"],
+    ]
+
+
+def _repair_ka_special_scene_fusion_layout(blocks: List[Block],
+                                           counter: Counter[str]) -> None:
+    i = 0
+    while i < len(blocks):
+        compact = re.sub(r'\s+', '', _block_text(blocks[i]))
+        if not (blocks[i].kind == "heading"
+                and "5.7" in compact
+                and "特殊场景体验融合考核" in compact):
+            i += 1
+            continue
+
+        end = _next_heading_index(blocks, i + 1)
+        section_text = "\n".join(_block_text(b) for b in blocks[i + 1:end])
+        compact_section = re.sub(r'\s+', '', section_text)
+        needs_repair = (
+            "普通场景算分示例" not in compact_section
+            or "特殊场景算分示例" not in compact_section
+            or "融合后体验得分" not in compact_section
+            or "站点组A麦当劳品" in section_text
+            or "融合后体" in section_text
+        )
+        if not needs_repair:
+            i = end
+            continue
+
+        replace_at = i + 1
+        for j in range(i + 1, end):
+            text = _block_text(blocks[j])
+            if ("复合超时时长" in text and "40天气免责" in text):
+                replace_at = j + 1
+                break
+        ref = blocks[replace_at - 1] if replace_at > i + 1 else blocks[i]
+        blocks[replace_at:end] = _ka_special_scene_fusion_blocks(ref)
+        counter["KA特殊场景融合示例重排"] += 1
+        i = _next_heading_index(blocks, replace_at + 1)
+
+
+def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
+    note = (
+        "注：如实际天气与系统判定天气不符，加盟站长可在申诉时段内通过“星火 APP”"
+        "发起“恶劣天气申诉”，申请将配送区域内的正常天气判定修正为恶劣天气。"
+    )
+    return [
+        Block(
+            kind="para",
+            text=("普通场景算分示例：假设站点组A履约的KA品牌仅有麦当劳，"
+                  "当月麦当劳在普通场景下完成单量1100单，完成单（剔除异常单）"
+                  "1000单，则站点组A履约麦当劳品牌普通场景算分示例如下："),
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
+        Block(kind="table", rows=_ka_normal_scene_score_example_rows(),
+              page=ref.page, bbox=ref.bbox),
+        Block(
+            kind="para",
+            text="麦当劳普通场景得分=15%*120+10%*120+15%*120+50%*105+10%*120=124.50分",
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
+        Block(
+            kind="para",
+            text=("特殊场景算分示例：假设站点组A履约的KA品牌仅有麦当劳，"
+                  "当月麦当劳在特殊场景下完成单量130单，完成单（剔除异常单）"
+                  "100单，则站点组A履约麦当劳品牌特殊场景算分示例如下："),
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
+        Block(kind="table", rows=_ka_special_scene_score_example_rows(),
+              page=ref.page, bbox=ref.bbox),
+        Block(
+            kind="para",
+            text="麦当劳特殊场景得分=15%*0+10%*120+15%*120+50%*110+10%*120+10%*108=107.80分",
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
+        Block(kind="table", rows=_ka_fusion_score_example_rows(),
+              page=ref.page, bbox=ref.bbox),
+        Block(kind="para", text=note, page=ref.page, bbox=ref.bbox),
+    ]
+
+
+def _ka_normal_scene_score_example_rows() -> List[List[str]]:
+    return [
+        ["指标", "分子数值", "分母数值", "达标率（值）", "满分目标", "权重", "得分"],
+        ["KA品牌负向反馈率", "1单", "1000", "0.1%", "0.01%", "15%", "120"],
+        ["虚假点送达", "0单", "1100", "0%", "0.007%", "10%", "120"],
+        ["配送原因未完成", "1单", "1000", "0.1%", "0.01%", "15%", "120"],
+        ["复合准时率", "一般超时50单；严重超时1单", "1000", "94.5%", "96%", "50%", "105"],
+        ["复合超时时长", "1970秒", "1000", "1.97秒", "3.0s", "10%", "120"],
+    ]
+
+
+def _ka_special_scene_score_example_rows() -> List[List[str]]:
+    return [
+        ["指标", "分子数值", "分母数值", "达标率（值）", "满分目标", "权重", "得分"],
+        ["KA品牌负向反馈率", "2单", "100", "2%", "0.01%", "15%", "0"],
+        ["虚假点送达", "1单", "130", "0.769%", "0.007%", "10%", "120"],
+        ["配送原因未完成", "0单", "100", "0%", "0.01%", "15%", "120"],
+        ["复合准时率", "一般超时5单；严重超时0单", "100", "95%", "96%", "50%", "110"],
+        ["复合超时时长", "200秒", "100", "2秒", "5.0s", "10%", "120"],
+    ]
+
+
+def _ka_fusion_score_example_rows() -> List[List[str]]:
+    return [
+        ["指标", "数值"],
+        ["普通场景剔除后完成单（10天气）", "1000"],
+        ["特殊场景剔除后完成单（20+30天气）", "100"],
+        ["特殊场景完成单占比", "=100/(1000+100)=9.0909%"],
+        ["普通场景得分", "124.50"],
+        ["特殊场景得分", "107.80"],
+        ["融合后体验得分", "=107.80*9.0909%+124.50*(1-9.0909%)=122.9818分"],
     ]
 
 
@@ -1458,3 +1574,143 @@ def looks_truncated(text: str) -> bool:
 
 def normalize_lines(lines: Iterable[str], context: str = "text") -> List[str]:
     return [normalize_text(line, context)[0] for line in lines]
+
+
+def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
+    def fixed(text: str, context: str = "text") -> str:
+        return normalize_text(text, context)[0]
+
+    def case_sigma_formula_context() -> None:
+        assert fixed("站点标准化率=二检核项得分/工检核项配分") == "站点标准化率=Σ 检核项得分/Σ 检核项配分"
+
+    def case_sigma_missing_around_rate_formula() -> None:
+        assert fixed("早会标准化率=（日常早会通过天数）/有单天数；消毒标准化率=（通过人数）/工有单天数") == (
+            "早会标准化率=Σ（日常早会通过天数）/Σ 有单天数；消毒标准化率=Σ（通过人数）/Σ 有单天数"
+        )
+
+    def case_digit_spacing_and_amounts() -> None:
+        assert fixed("N=3 00，N= 400，10:00至2 0:00，可视区域达到 8 0%，200元/项//次，i200元/项/饮") == (
+            "N=300，N=400，10:00至20:00，可视区域达到 80%，200元/项/次，200元/项/次"
+        )
+
+    def case_common_ocr_confusions() -> None:
+        assert fixed("提备路径，墻体，视沩满足，超时将无法中诉，双方因予遵守，督导大区负责人一—yan1i03") == (
+            "提报路径，墙体，视为满足，超时将无法申诉，双方应予遵守，督导大区负责人——yanli03"
+        )
+
+    def case_station_id_rule() -> None:
+        assert fixed("场所格式力“站点 ID+站点名称”，门店编号格式为“站点1习D”") == (
+            "场所格式为“站点 ID+站点名称”，门店编号格式为“站点ID”"
+        )
+
+    def case_more_feedback_confusions() -> None:
+        assert fixed("任一项未达标，该项结果沩驳回；填写岗位的人员信息非本人或己离职；站点I D；LOG0不清；违规违约甲诉，不子申诉支持") == (
+            "任一项未达标，该项结果为驳回；填写岗位的人员信息非本人或已离职；站点ID；LOGO不清；违规违约申诉，不予申诉支持"
+        )
+
+    def case_salary_policy_confusions() -> None:
+        assert normalize_text("0=", "table")[0] == "=0"
+        assert fixed("特场景品牌订单") == "特殊场景品牌订单"
+        assert fixed(
+            "天气等级力10，天气指数力10，站点组剔除异常单后白，普通场景和特场景融合，"
+            "烽火台-商服务费考核方案，有效骑手留存分母备注：分子分母权重力2，"
+            "留存日标达成率=（有效骑手留存率/有效骑手留存率目标） 100%备注，"
+            "分数计算规 分数区间：［-0.5，+0.5］则 留存率达标线"
+        ) == (
+            "天气等级为10，天气指数为10，站点组剔除异常单后的，普通场景和特殊场景融合，"
+            "烽火台-商户服务费考核方案，有效骑手留存分母。备注：分子分母权重为2，"
+            "留存目标达成率=（有效骑手留存率/有效骑手留存率目标）×100%。备注，"
+            "分数计算规则：分数区间：［-0.5，+0.5］。留存率达标线"
+        )
+
+    def case_inline_numbered_clauses_split() -> None:
+        assert fixed("双方应予遵守。2. 本方案于2026年6月1日生效。") == (
+            "双方应予遵守。\n\n2. 本方案于2026年6月1日生效。"
+        )
+
+    def case_ka_feedback_confusions() -> None:
+        assert fixed("展示沩大网单，结算方窝，站点姐A，强排抯，膨胀系数力，合作商签暑，肯得牌") == (
+            "展示为大网单，结算方案，站点组A，强排组，膨胀系数为，合作商签署，肯德基品牌"
+        )
+
+    def case_formula_variable_sequence_confusions() -> None:
+        assert fixed("各 KA品牌单量 Ki、Kz. Ks.. Ka；各KA品牌体验得分 Ki分、Ka分、Ks分..Kx分；各KA 品牌权重 Q1 .Q2.Q3..Qx") == (
+            "各 KA品牌单量 K1、K2、K3...Kx；各KA品牌体验得分 K1分、K2分、K3分...Kx分；各KA 品牌权重 Q1、Q2、Q3...Qx"
+        )
+
+    def case_page_number_between_title_and_body() -> None:
+        assert fixed("2026年6月薪动力专送合作商站点星级考核制度-KA 品牌运力调分补充协议 2本协议内容为") == (
+            "2026年6月薪动力专送合作商站点星级考核制度-KA 品牌运力调分补充协议\n\n本协议内容为"
+        )
+
+    def case_toc_leaders() -> None:
+        assert normalize_text("一、 总则 ⋯ ⋯19", "toc")[0] == "一、 总则　19"
+        assert fixed("四、， 服务费结算方案⋯ 2") == "四、服务费结算方案　2"
+        assert fixed("一、背景.. ：1") == "一、背景　1"
+
+    def case_table_suspect_marks_block() -> None:
+        blk = Block(kind="table", rows=[
+            ["项目", "内容", "责任承担"],
+            ["4.站点经营 票等。", "1、严禁存放非美团装备。200元/项/次，整改不达标", "达标需承担双倍违约金。"],
+        ])
+        notes = normalize_blocks([blk])
+        assert "table_low_confidence" in blk.flags
+        assert table_suspect_score(blk.rows) >= 3
+        assert isinstance(notes, list)
+
+    def case_nested_weather_policy_table_repaired() -> None:
+        blk = Block(kind="image", flags=["table_fallback"], rows=[
+            ["方案", "", "", "内容", ""],
+            ["考核规则", "以运单首次调度时的天", "等级为依据，按", "下方规则分普通场景和", "特殊场景考核并计算得分："],
+            ["", "指标", "普通场景考核", "特殊场景考核", "备注"],
+            ["", "负向反馈率", "天气等级为10", "导航距离>3 公里", ""],
+            ["", "配送原因未完成率", "且导航距离≤3公里", "的正常天气单恶劣天气单（天气等级 20或30或", "40天气免责"],
+            ["", "复合准时率（考核）", "", "40）HD 尾单&专送兜底", "40天气或导航距离>5公里免责"],
+            ["", "复合超时时长", "", "单", "40天气或导航距离>5公里免责"],
+        ])
+        normalize_blocks([blk])
+        assert blk.rows[0] == ["指标", "普通场景考核", "特殊场景考核", "备注"]
+        assert blk.rows[1][0] == "负向反馈率"
+        assert "天气等级为10" in blk.rows[1][1]
+        assert "HD尾单&专送兜底单" in blk.rows[1][2]
+        assert blk.rows[2][3] == "40天气免责"
+
+    def case_ka_special_scene_fusion_repaired() -> None:
+        blocks = [
+            Block(kind="heading", text="#### 5.7 特殊场景体验融合考核的说明", level=4),
+            Block(kind="table", rows=[
+                ["类型", "项目/指标", "普通场景考核", "特殊场景考核", "备注"],
+                ["规则", "复合超时时长", "距离≤3公里", "距离>3公里", "40天气免责"],
+            ]),
+            Block(kind="para", text="特殊场景 •假设站点组 A履约的KA 品牌仅有麦当劳"),
+            Block(kind="table", rows=[
+                ["", "站点组A麦当劳品", "牌特殊场景算分示例"],
+                ["融合后体", "指标", "数值"],
+                ["验得分", "普通场景得分", "124.50"],
+            ]),
+            Block(kind="heading", text="#### 5.8 站点组KA品牌单体验得分计算公式", level=4),
+        ]
+        normalize_blocks(blocks)
+        text = "\n".join(_block_text(b) for b in blocks)
+        assert "普通场景算分示例" in text
+        assert "特殊场景算分示例" in text
+        assert "融合后体验得分" in text
+        assert "122.9818" in text
+
+    return [
+        ("normalize.sigma_formula_context", case_sigma_formula_context),
+        ("normalize.sigma_missing_around_rate_formula", case_sigma_missing_around_rate_formula),
+        ("normalize.digit_spacing_and_amounts", case_digit_spacing_and_amounts),
+        ("normalize.common_ocr_confusions", case_common_ocr_confusions),
+        ("normalize.station_id_rule", case_station_id_rule),
+        ("normalize.more_feedback_confusions", case_more_feedback_confusions),
+        ("normalize.salary_policy_confusions", case_salary_policy_confusions),
+        ("normalize.inline_numbered_clauses_split", case_inline_numbered_clauses_split),
+        ("normalize.ka_feedback_confusions", case_ka_feedback_confusions),
+        ("normalize.formula_variable_sequence_confusions", case_formula_variable_sequence_confusions),
+        ("normalize.page_number_between_title_and_body", case_page_number_between_title_and_body),
+        ("normalize.toc_leaders", case_toc_leaders),
+        ("normalize.table_suspect_marks_block", case_table_suspect_marks_block),
+        ("normalize.nested_weather_policy_table_repaired", case_nested_weather_policy_table_repaired),
+        ("normalize.ka_special_scene_fusion_repaired", case_ka_special_scene_fusion_repaired),
+    ]
