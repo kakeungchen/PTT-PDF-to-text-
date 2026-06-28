@@ -3,12 +3,6 @@ import os
 import re
 from typing import List
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor, Inches
-
 from .models import Block, DocResult
 
 # 列表式段落（①、a.、1.1、•…）不做首行缩进
@@ -225,6 +219,9 @@ def export_markdown(result: DocResult, out_path: str) -> str:
 
 
 def _set_cn_font(run, size=None, bold=None):
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
     run.font.name = "Times New Roman"
     r = run._element.rPr.rFonts
     r.set(qn("w:eastAsia"), "宋体")
@@ -235,6 +232,9 @@ def _set_cn_font(run, size=None, bold=None):
 
 
 def _shade_cell(cell, fill="EFEFEF"):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
     tc_pr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
@@ -243,6 +243,11 @@ def _shade_cell(cell, fill="EFEFEF"):
 
 
 def export_docx(result: DocResult, out_path: str) -> str:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"

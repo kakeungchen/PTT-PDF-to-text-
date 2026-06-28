@@ -16,7 +16,7 @@ import tempfile
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from .pipeline import convert
+from .selfcheck import run_selfcheck as run_builtin_selfcheck
 
 
 BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
@@ -134,6 +134,8 @@ def _append_critical_missing_section_issues(text: str,
 
 
 def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
+    from .pipeline import convert
+
     progress_name = os.path.basename(pdf_path)
 
     def progress(msg, frac):
@@ -181,7 +183,8 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
 
 
 def run_audit(pdf_dir: str, sample_size: int = 4, offset: int = 0,
-              out_dir: str = None, keep_output: bool = False) -> Dict[str, object]:
+              out_dir: str = None, keep_output: bool = False,
+              skip_selfcheck: bool = False) -> Dict[str, object]:
     pdf_dir = os.path.abspath(pdf_dir)
     pdfs = list_pdfs(pdf_dir)
     sample = select_sample(pdfs, sample_size, offset)
@@ -189,8 +192,18 @@ def run_audit(pdf_dir: str, sample_size: int = 4, offset: int = 0,
     out_dir = out_dir or os.path.join(tempfile.gettempdir(), f"ptt_audit_{stamp}")
     os.makedirs(out_dir, exist_ok=True)
 
+    if skip_selfcheck:
+        selfcheck = {
+            "ok": True,
+            "skipped": True,
+            "tests_run": 0,
+            "failures": [],
+        }
+    else:
+        selfcheck = run_builtin_selfcheck(stream=sys.stderr, verbosity=1)
+
     results = [audit_pdf(path, out_dir) for path in sample]
-    ok = bool(sample) and all(item["ok"] for item in results)
+    ok = selfcheck["ok"] and bool(sample) and all(item["ok"] for item in results)
     report = {
         "ok": ok,
         "pdf_dir": pdf_dir,
@@ -198,6 +211,7 @@ def run_audit(pdf_dir: str, sample_size: int = 4, offset: int = 0,
         "sample_size": len(sample),
         "offset": offset,
         "out_dir": out_dir if keep_output else None,
+        "selfcheck": selfcheck,
         "results": results,
     }
     if not keep_output:
@@ -214,16 +228,26 @@ def main(argv=None) -> int:
     ap.add_argument("--offset", type=int, default=0, help="抽样起点")
     ap.add_argument("--out-dir", default=None, help="临时输出目录")
     ap.add_argument("--keep-output", action="store_true", help="保留临时输出")
+    ap.add_argument("--skip-selfcheck", action="store_true",
+                    help="跳过内建回归自查，只跑 PDF 抽检")
     ap.add_argument("--json", action="store_true", help="JSON 输出")
     args = ap.parse_args(argv)
 
     report = run_audit(args.pdf_dir, args.sample_size, args.offset,
-                       args.out_dir, args.keep_output)
+                       args.out_dir, args.keep_output, args.skip_selfcheck)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         status = "通过" if report["ok"] else "发现问题"
         print(f"抽检{status}: {report['sample_size']}/{report['total_pdfs']}")
+        selfcheck = report.get("selfcheck", {})
+        if selfcheck.get("skipped"):
+            print("- 内建自查: 已跳过")
+        else:
+            mark = "✓" if selfcheck.get("ok") else "⚠"
+            print(f"{mark} 内建自查: {selfcheck.get('tests_run', 0)}项")
+            for failure in selfcheck.get("failures", [])[:5]:
+                print(f"  - {failure['test']}: {failure['message']}")
         for item in report["results"]:
             mark = "✓" if item["ok"] else "⚠"
             print(f"{mark} {os.path.basename(item['source'])}")
