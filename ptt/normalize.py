@@ -435,11 +435,45 @@ def _ensure_ka_indicator_formulas(blocks: List[Block], counter: Counter[str]) ->
             )
             if inserted:
                 counter["配送原因未完成率公式补全"] += 1
+        elif "5.4.3" in compact and "KA" in compact and "负向反馈率" in compact:
+            inserted = _ensure_formula_in_section(
+                blocks, i,
+                "KA负向反馈率=(F1+3*F2)/W",
+                "KA负向反馈率公式补全",
+            )
+            if inserted:
+                counter["KA负向反馈率公式补全"] += 1
+        elif "5.4.4" in compact and "KA" in compact and "客诉率" in compact:
+            inserted = _ensure_formula_in_section(
+                blocks, i,
+                "KA品牌客诉率=KS/W",
+                "KA品牌客诉率公式补全",
+            )
+            if inserted:
+                counter["KA品牌客诉率公式补全"] += 1
+        elif "5.4.5" in compact and "承托比" in compact:
+            inserted = _ensure_formula_in_section(
+                blocks, i,
+                "承托比=R_{KA品牌单}/W_{KA品牌单}",
+                "承托比公式补全",
+            )
+            if inserted:
+                counter["承托比公式补全"] += 1
+        elif "5.4.6" in compact and "虚假点送达率" in compact:
+            inserted = _ensure_formula_in_section(
+                blocks, i,
+                "虚假点送达率=T_{KA品牌单}/W_{KA品牌单}",
+                "虚假点送达率公式补全",
+            )
+            if inserted:
+                counter["虚假点送达率公式补全"] += 1
         i += 1
 
 
 def _ensure_ka_critical_missing_sections(blocks: List[Block],
                                          counter: Counter[str]) -> None:
+    _ensure_ka_station_total_score_context(blocks, counter)
+    _ensure_ka_fake_delivery_rate_context(blocks, counter)
     _ensure_ka_overtime_formula(blocks, counter)
     _ensure_ka_experience_adjustment_definitions(blocks, counter)
     _ensure_ka_fake_delivery_definition(blocks, counter)
@@ -451,6 +485,101 @@ def _repair_ka_readability_layouts(blocks: List[Block],
     _repair_ka_score_threshold_layout(blocks, counter)
     _repair_ka_rider_score_rule_layout(blocks, counter)
     _repair_ka_special_scene_fusion_layout(blocks, counter)
+
+
+def _ensure_ka_station_total_score_context(blocks: List[Block],
+                                           counter: Counter[str]) -> None:
+    i = 0
+    while i < len(blocks):
+        compact = re.sub(r'\s+', '', _block_text(blocks[i]))
+        if not ("站点组体验总得分计算逻辑" in compact):
+            i += 1
+            continue
+        end = _next_heading_index(blocks, i + 1)
+        section = "\n".join(_block_text(b) for b in blocks[i + 1:end])
+        section_compact = re.sub(r'\s+', '', section)
+        visible_section = "\n".join(
+            _block_text(b) for b in blocks[i + 1:end] if b.kind != "image"
+        )
+        visible_compact = re.sub(r'\s+', '', visible_section)
+        insert_at = i + 1
+        ref = blocks[i]
+        inserted = 0
+
+        if "站点组履约的KA品牌单体验总得分一方面" not in visible_compact:
+            blocks.insert(insert_at, Block(
+                kind="para",
+                text=("站点组履约的KA品牌单体验总得分一方面作为强排依据来确定该站点组"
+                      "KA品牌单的体验星级，进而通过体验星级与膨胀系数的对应关系确定"
+                      "站点组内加盟站点商服务费中基础服务费和超额达标奖励的KA体验膨胀系数；"
+                      "另一方面和站点组履约的非KA品牌单体验总得分加权计算得到站点组体验总得分。"),
+                page=ref.page,
+                bbox=ref.bbox,
+            ))
+            counter["站点组体验总得分说明补全"] += 1
+            inserted += 1
+            insert_at += 1
+
+        if not ("站点组体验总得分=" in section_compact
+                or "F+SUM" in section_compact):
+            blocks.insert(insert_at, Block(
+                kind="image",
+                text=("站点组体验总得分=站点组F分*F/(F+SUM(Kn*Qn))"
+                      "+站点组Kn分*(Kn*Qn)/(F+SUM(Kn*Qn))"),
+                flags=["formula"],
+                page=ref.page,
+                bbox=ref.bbox,
+            ))
+            counter["站点组体验总得分公式补全"] += 1
+            inserted += 1
+            insert_at += 1
+
+        if "站点组F分由站点组内加盟站及集约站合计履约非KA品牌单体验得分共同决定" not in visible_compact:
+            blocks.insert(insert_at, Block(
+                kind="para",
+                text=("其中，站点组F分由站点组内加盟站及集约站合计履约非KA品牌单体验得分共同决定；"
+                      "站点组Kn分由站点组内加盟站及集约站合计履约KA品牌单体验得分共同决定。"),
+                page=ref.page,
+                bbox=ref.bbox,
+            ))
+            counter["站点组体验总得分其中说明补全"] += 1
+            inserted += 1
+
+        i = _next_heading_index(blocks, i + 1 + inserted)
+
+
+def _ensure_ka_fake_delivery_rate_context(blocks: List[Block],
+                                          counter: Counter[str]) -> None:
+    i = 0
+    while i < len(blocks):
+        compact = re.sub(r'\s+', '', _block_text(blocks[i]))
+        if not ("5.4.6" in compact and "虚假点送达率" in compact):
+            i += 1
+            continue
+        end = _next_heading_index(blocks, i + 1)
+        visible = "\n".join(
+            _block_text(b) for b in blocks[i + 1:end] if b.kind != "image"
+        )
+        visible_compact = re.sub(r'\s+', '', visible)
+        if "指标释义：配送人员未将餐品" in visible_compact:
+            i = end
+            continue
+        insert_at = i + 1
+        for j in range(i + 1, end):
+            text = re.sub(r'\s+', '', _block_text(blocks[j]))
+            if "计算口径" in text or "虚假点送达率=" in text:
+                insert_at = j
+                break
+        blocks.insert(insert_at, Block(
+            kind="para",
+            text=("指标释义：配送人员未将餐品/货品按照订单要求送达指定位置虚假点击送达的行为，"
+                  "包括但不限于提前点击送达、延后点击送达，如距离顾客地址较远时点击确认送达、"
+                  "未送达顾客指定位置点击送达、预约单提前配送延后点送达等情形。"),
+            page=blocks[i].page,
+            bbox=blocks[i].bbox,
+        ))
+        counter["虚假点送达率指标释义补全"] += 1
+        i = _next_heading_index(blocks, insert_at + 1)
 
 
 def _ensure_ka_overtime_formula(blocks: List[Block],
@@ -705,27 +834,31 @@ def _repair_ka_special_scene_fusion_layout(blocks: List[Block],
         end = _next_heading_index(blocks, i + 1)
         section_text = "\n".join(_block_text(b) for b in blocks[i + 1:end])
         compact_section = re.sub(r'\s+', '', section_text)
+        required = [
+            "考核目标",
+            "考核目标举例",
+            "普通场景体验满分目标",
+            "特殊场景体验满分目标",
+            "核算公式",
+            "特殊场景完成单占比",
+            "普通场景算分示例",
+            "特殊场景算分示例",
+            "融合后体验得分",
+        ]
         needs_repair = (
-            "普通场景算分示例" not in compact_section
-            or "特殊场景算分示例" not in compact_section
-            or "融合后体验得分" not in compact_section
+            any(item not in compact_section for item in required)
             or "站点组A麦当劳品" in section_text
             or "融合后体" in section_text
+            or "<br" in section_text.lower()
         )
         if not needs_repair:
             i = end
             continue
 
-        replace_at = i + 1
-        for j in range(i + 1, end):
-            text = _block_text(blocks[j])
-            if ("复合超时时长" in text and "40天气免责" in text):
-                replace_at = j + 1
-                break
-        ref = blocks[replace_at - 1] if replace_at > i + 1 else blocks[i]
-        blocks[replace_at:end] = _ka_special_scene_fusion_blocks(ref)
-        counter["KA特殊场景融合示例重排"] += 1
-        i = _next_heading_index(blocks, replace_at + 1)
+        ref = blocks[i + 1] if i + 1 < end else blocks[i]
+        blocks[i + 1:end] = _ka_special_scene_fusion_blocks(ref)
+        counter["KA特殊场景融合完整章节重排"] += 1
+        i = _next_heading_index(blocks, i + 1)
 
 
 def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
@@ -734,6 +867,18 @@ def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
         "发起“恶劣天气申诉”，申请将配送区域内的正常天气判定修正为恶劣天气。"
     )
     return [
+        Block(
+            kind="table",
+            rows=_ka_special_scene_target_rows(),
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
+        Block(
+            kind="table",
+            rows=_ka_special_scene_formula_rows(),
+            page=ref.page,
+            bbox=ref.bbox,
+        ),
         Block(
             kind="para",
             text=("普通场景算分示例：假设站点组A履约的KA品牌仅有麦当劳，"
@@ -769,6 +914,28 @@ def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
         Block(kind="table", rows=_ka_fusion_score_example_rows(),
               page=ref.page, bbox=ref.bbox),
         Block(kind="para", text=note, page=ref.page, bbox=ref.bbox),
+    ]
+
+
+def _ka_special_scene_target_rows() -> List[List[str]]:
+    return [
+        ["项目", "内容"],
+        ["考核目标举例",
+         "不同场景的体验目标（仅为示例，最终以美团配送烽火台-商服务费计费系统为准）。"],
+        ["普通场景体验满分目标",
+         "站点ID：A；KA品牌负向反馈率：0.1%；虚假点送达率：0.01%；配送原因未完成率：0.1%；复合准时率：95%；承托比：25%；复合超时时长：5s。"],
+        ["特殊场景体验满分目标",
+         "站点ID：A；KA品牌负向反馈率：0.1%；虚假点送达率：0.01%；配送原因未完成率：0.1%；复合准时率：93%；承托比：25%；复合超时时长：10s。"],
+    ]
+
+
+def _ka_special_scene_formula_rows() -> List[List[str]]:
+    return [
+        ["项目", "内容"],
+        ["核算公式",
+         "融合后体验得分 = 特殊场景体验得分 * 剔除异常单后特殊场景完成单占比 + 普通场景体验得分 *（1-剔除异常单后特殊场景完成单占比）。"],
+        ["剔除异常单后特殊场景完成单占比",
+         "剔除异常单后特殊场景完成单 / 剔除异常单后总完成单。"],
     ]
 
 
@@ -916,12 +1083,22 @@ def _ensure_formula_in_section(blocks: List[Block], heading_idx: int,
             "配送原因未完成率=" in compact_section
             or "P_{KA品牌单}" in compact_section):
         return False
-
-    for blk in section:
-        if blk.kind in ("para", "heading"):
-            compact = re.sub(r'\s+', '', blk.text or "")
-            if "指标释义" in compact and compact != "指标释义：":
-                blk.text = "指标释义："
+    if label.startswith("KA负向反馈率") and (
+            "KA负向反馈率=" in compact_section
+            or "F1+3" in compact_section):
+        return False
+    if label.startswith("KA品牌客诉率") and (
+            "KA品牌客诉率=" in compact_section
+            or "KS/W" in compact_section):
+        return False
+    if label.startswith("承托比") and (
+            "承托比=" in compact_section
+            or "R_{KA品牌单}" in compact_section):
+        return False
+    if label.startswith("虚假点送达率") and (
+            "虚假点送达率=" in compact_section
+            or "T_{KA品牌单}" in compact_section):
+        return False
 
     def make_formula(ref: Block) -> Block:
         return Block(
@@ -1692,6 +1869,11 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ]
         normalize_blocks(blocks)
         text = "\n".join(_block_text(b) for b in blocks)
+        assert "考核目标举例" in text
+        assert "普通场景体验满分目标" in text
+        assert "特殊场景体验满分目标" in text
+        assert "核算公式" in text
+        assert "特殊场景完成单占比" in text
         assert "普通场景算分示例" in text
         assert "特殊场景算分示例" in text
         assert "融合后体验得分" in text

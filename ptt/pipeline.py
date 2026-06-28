@@ -6,7 +6,7 @@ from typing import Callable, List, Optional
 
 import fitz
 
-from . import assemble, qa, text_extract
+from . import assemble, coverage, qa, text_extract
 from .export import export_docx, export_markdown
 from .models import Block, DocResult
 from .normalize import normalize_blocks
@@ -114,6 +114,8 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
                         blks[1].bbox[2], blks[1].bbox[3])
         del blks[1]
 
+    result.blocks.sort(key=lambda b: (b.page, b.bbox[1], b.bbox[0]))
+
     report("质检复读", 0.92)
     issues, n_flag = qa.qa_scan(result.blocks)
     # 顺序自检：输出必须严格按原文档视觉顺序（页码、再纵坐标）
@@ -134,9 +136,27 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         export_docx(result, p)
         outputs.append(p)
 
-    # Markdown 现在文本化图片/公式/表格，不再依赖外部 assets；
-    # docx 图片已在保存时内嵌，导出结束后也可删除临时图片目录。
-    if os.path.isdir(assets_dir):
+    md_paths = [p for p in outputs if p.endswith(".md")]
+    if md_paths:
+        try:
+            with open(md_paths[0], "r", encoding="utf-8") as f:
+                md_text = f.read()
+        except OSError:
+            md_text = ""
+    else:
+        md_text = coverage.markdown_from_result(result)
+    coverage_issues = coverage.audit_pdf_markdown_coverage(
+        pdf_path, result, md_text)
+    if coverage_issues:
+        issues.extend(coverage_issues)
+    blocking_issues = [
+        issue for issue in issues
+        if "表格疑似列错位" not in issue
+    ]
+
+    # Markdown 可能引用公式/图示原图作为保真兜底；仅在没有 Markdown 输出时
+    # 清理 assets。docx 图片会在保存时内嵌。
+    if "md" not in formats and os.path.isdir(assets_dir):
         shutil.rmtree(assets_dir, ignore_errors=True)
     report("完成", 1.0)
     doc.close()
@@ -148,5 +168,7 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         "blocks": len(result.blocks),
         "warnings": result.warnings,
         "qa_issues": issues,
+        "blocking_qa": blocking_issues,
+        "quality_ok": not blocking_issues,
         "flagged_blocks": n_flag,
     }

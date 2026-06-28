@@ -44,11 +44,17 @@ def main(argv=None):
             print(file=sys.stderr)
             results.append(res)
             if not args.json:
-                print(f"✓ {path}")
+                mark = "✓" if res.get("quality_ok", True) else "⚠"
+                label = "转换完成" if res.get("quality_ok", True) else "转换完成，但质量审计需复核"
+                print(f"{mark} {label}: {path}")
                 for o in res["outputs"]:
                     print(f"   -> {o}")
                 if res["flagged_blocks"]:
                     print(f"   ⚠ {res['flagged_blocks']} 处低置信内容已标注，建议人工核对")
+                for issue in res.get("qa_issues", [])[:8]:
+                    print(f"   ⚠ {issue}")
+            if not res.get("quality_ok", True):
+                code = 1
         except Exception as e:
             print(f"\n✗ {path}: {e}", file=sys.stderr)
             results.append({"source": path, "error": str(e)})

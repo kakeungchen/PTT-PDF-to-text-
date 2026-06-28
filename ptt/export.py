@@ -22,10 +22,16 @@ def _md_escape_cell(s: str) -> str:
     return _md_escape_text(clean).replace("|", "\\|")
 
 
+def _md_image_link(image_path: str, out_path: str, alt: str) -> str:
+    rel = os.path.relpath(image_path, os.path.dirname(out_path))
+    rel = rel.replace(os.sep, "/")
+    return f"![{_md_escape_text(alt)}](<{rel}>)"
+
+
 def _split_long_text_line(line: str, limit: int = 180) -> List[str]:
     if len(line) <= limit:
         return [line]
-    pieces = re.split(r'([。；;，、+＋])', line)
+    pieces = re.split(r'([。；;，、+＋=＝:：])', line)
     chunks: List[str] = []
     chunk = ""
     for piece in pieces:
@@ -49,7 +55,9 @@ def _readable_text_lines(text: str) -> List[str]:
     if not text:
         return []
     text = re.sub(r'\s*<br\s*/?>\s*', "\n", text, flags=re.I)
-    text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|指标定义\d*[:：]|计算公式[:：]))',
+    text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|其中[:：]|'
+                  r'指标定义\d*[:：]|计算公式[:：]|核算公式[:：]|'
+                  r'计分规则\d*[:：]|数据来源[:：]|分数计算规则[:：]))',
                   "\n", text)
     text = re.sub(r'(?<!^)(?=(?:麦当劳|肯德基|必胜客)完单量占比=)', "\n", text)
     text = re.sub(r'(?<!^)(?=30分钟内送达订单占比（)', "\n", text)
@@ -73,6 +81,10 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
     if any("\n" in c or "<br" in c.lower() for r in padded for c in r):
         return True
     if any(len(c) > 90 for r in padded for c in r):
+        return True
+    if ncol >= 4 and any(
+            any(term in c for term in ("指标", "目标", "公式", "权重", "得分"))
+            for r in padded[:2] for c in r):
         return True
     if ncol >= 3 and any(not r[0].strip() for r in padded[1:]):
         return True
@@ -190,6 +202,21 @@ def _formula_to_latex(text: str) -> str:
             r"\text{配送原因未完成率}"
             r"=\frac{P_{\text{KA品牌单}}}"
             r"{W_{\text{KA品牌单}}+P_{\text{KA品牌单}}}"
+        )
+    if ("KA" in compact and "负向反馈率" in compact
+            and "F1" in compact and "F2" in compact and "W" in compact):
+        return r"\text{KA负向反馈率} = \frac{F1+3\times F2}{W}"
+    if ("KA品牌客诉率" in compact and "KS" in compact and "W" in compact):
+        return r"\text{KA品牌客诉率} = \frac{KS}{W}"
+    if ("承托比" in compact and "R" in compact and "W" in compact):
+        return (
+            r"\text{承托比}"
+            r"=\frac{R_{\text{KA品牌单}}}{W_{\text{KA品牌单}}}"
+        )
+    if ("虚假点送达率" in compact and "T" in compact and "W" in compact):
+        return (
+            r"\text{虚假点送达率}"
+            r"=\frac{T_{\text{KA品牌单}}}{W_{\text{KA品牌单}}}"
         )
     if ("KA品牌驻点骑手考核得分" in compact
             and all(token in compact for token in ("W1", "W2", "W3", "W4"))):
@@ -320,13 +347,26 @@ def export_markdown(result: DocResult, out_path: str) -> str:
                 latex = _formula_to_latex(b.text)
                 if latex:
                     lines.append(f"$${latex}$$")
+                elif b.image_path and os.path.exists(b.image_path):
+                    lines.append(_md_image_link(b.image_path, out_path, "公式原图"))
+                elif b.text:
+                    lines.append("**公式原文（需复核）**")
+                    lines.append("")
+                    for ln in _readable_text_lines(b.text):
+                        lines.append(_md_escape_text(ln))
             elif b.rows:
                 emit_table(b.rows)
+                if b.image_path and os.path.exists(b.image_path):
+                    lines.append(_md_image_link(b.image_path, out_path, "表格原图"))
             elif b.text:
                 if _image_caption_reliable(b):
                     for ln in b.text.splitlines():
                         if ln.strip():
                             lines.append(_md_escape_text(ln.strip()))
+                elif b.image_path and os.path.exists(b.image_path):
+                    lines.append(_md_image_link(b.image_path, out_path, "图示原图"))
+            elif b.image_path and os.path.exists(b.image_path):
+                lines.append(_md_image_link(b.image_path, out_path, "图示原图"))
         lines.append("")
     md = "\n".join(lines).strip() + "\n"
     md = re.sub(r"\n{3,}", "\n\n", md)
@@ -494,6 +534,21 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert r"\text{复合超时时长} = \frac{A1 + A2 + A3}{W}" in text
         assert "![公式]" not in text
 
+    def case_unknown_formula_exports_original_image() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            img_dir = os.path.join(td, "out_assets")
+            os.makedirs(img_dir)
+            img_path = os.path.join(img_dir, "formula.png")
+            with open(img_path, "wb") as f:
+                f.write(b"not-a-real-png")
+            out_path = os.path.join(td, "out.md")
+            export_markdown(DocResult(blocks=[
+                Block(kind="image", flags=["formula"], image_path=img_path)
+            ]), out_path)
+            text = open(out_path, encoding="utf-8").read()
+        assert "![公式原图]" in text
+        assert "out_assets/formula.png" in text
+
     def case_fraction_formula_keeps_visual_order() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="image", flags=["formula"], text="P\n配送原因未完成率 =\nW+P")
@@ -565,6 +620,23 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "| 指标 | 值 |" in text
         assert "![表格截图]" not in text
 
+    def case_image_table_preserves_original_when_available() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            img_dir = os.path.join(td, "out_assets")
+            os.makedirs(img_dir)
+            img_path = os.path.join(img_dir, "table.png")
+            with open(img_path, "wb") as f:
+                f.write(b"not-a-real-png")
+            out_path = os.path.join(td, "out.md")
+            export_markdown(DocResult(blocks=[
+                Block(kind="image", rows=[["数据", "查询路径"], ["KA", "系统"]],
+                      image_path=img_path)
+            ]), out_path)
+            text = open(out_path, encoding="utf-8").read()
+        assert "| 数据 | 查询路径 |" in text
+        assert "![表格原图]" in text
+        assert "out_assets/table.png" in text
+
     def case_complex_table_exports_readable_blocks_without_br() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="table", rows=[
@@ -588,6 +660,7 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.unreliable_image_caption_does_not_export_link", case_unreliable_image_caption_does_not_export_link),
         ("export.digit_only_image_caption_does_not_export_link", case_digit_only_image_caption_does_not_export_link),
         ("export.formula_image_exports_latex", case_formula_image_exports_latex),
+        ("export.unknown_formula_exports_original_image", case_unknown_formula_exports_original_image),
         ("export.fraction_formula_keeps_visual_order", case_fraction_formula_keeps_visual_order),
         ("export.weighted_special_scene_formula_recovered", case_weighted_special_scene_formula_recovered),
         ("export.station_group_experience_formula_recovered", case_station_group_experience_formula_recovered),
@@ -595,5 +668,6 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.ka_weighted_example_formula_keeps_numbers", case_ka_weighted_example_formula_keeps_numbers),
         ("export.ka_formula_recovery", case_ka_formula_recovery),
         ("export.textual_image_table_exports_table_without_link", case_textual_image_table_exports_table_without_link),
+        ("export.image_table_preserves_original_when_available", case_image_table_preserves_original_when_available),
         ("export.complex_table_exports_readable_blocks_without_br", case_complex_table_exports_readable_blocks_without_br),
     ]

@@ -29,10 +29,10 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 | **Text & scanned PDFs** | Native text layer extraction; on-device Chinese/English OCR for scans and ultra-long screenshot PDFs |
 | **Watermark removal** | Diagonal / light-colored security watermarks and repeated confidentiality banners are stripped automatically |
 | **Header & footer removal** | Doc IDs, page numbers, logos and periodic repeats — including the "virtual pages" inside stitched long screenshots |
-| **Table reconstruction** | Ruling-based grid recovery: cross-page tables, merged cells, narrow tables, light-gray borders, shaded headers |
+| **Table reconstruction** | Simple tables stay as Markdown tables; cross-page, merged-cell, multi-header, and long-description tables are rewritten into readable grouped text |
 | **Formulas & diagrams** | Content OCR can't faithfully linearize (fractions, subscripts, flowcharts) is **embedded as pixel-perfect crops** instead of wrong text |
 | **Figure text, structured** | Text inside diagrams is re-laid-out by geometry into readable tables — both humans and AI agents can parse it |
-| **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom and only accepted when two independent passes agree; document-wide frequency voting fixes look-alike character errors; anything still uncertain is **explicitly flagged** (yellow highlight in Word) |
+| **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom; headings, formulas, key numbers, and metric names are checked for source-to-output coverage; anything still uncertain is **explicitly flagged** (yellow highlight in Word) |
 | **Clean output** | Temp files are deleted automatically — you get just the `.docx` / `.md` (plus the image folder Markdown references) |
 | **Agent-friendly** | CLI with JSON output mode: progress on stderr, machine-readable results on stdout |
 
@@ -66,7 +66,7 @@ PDF ──▶ per-page type detection
      ──▶ ruling-based table grid reconstruction (cross-page merge)
      ──▶ diagram / formula region detection → pixel-perfect crops
      ──▶ reading-order assembly (headings · paragraphs · tables · figures)
-     ──▶ QA: 2× re-OCR cross-check · frequency-vote typo repair · explicit flags
+     ──▶ QA: 2× re-OCR cross-check · frequency-vote typo repair · coverage audit · readability audit
      ──▶ Word (.docx) / Markdown (.md)
 ```
 

@@ -99,6 +99,10 @@ class Worker(QThread):
                 if res["flagged_blocks"]:
                     self.log.emit(f"  ⚠ {res['flagged_blocks']} 处低置信内容已标注"
                                   "（Word 中为黄色高亮），建议人工核对")
+                if not res.get("quality_ok", True):
+                    self.log.emit("  ⚠ 质量审计发现问题，建议打开 Markdown 对照 PDF 复核")
+                    for issue in res.get("qa_issues", [])[:8]:
+                        self.log.emit(f"    - {issue}")
             except Exception as e:
                 fail += 1
                 self.log.emit(f"  ✗ 失败: {e}")

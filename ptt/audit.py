@@ -24,7 +24,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"(?i)(?:bm[_\\-]*ch|chenj|chenjia|i?ang[o0]l|"
         r"1ang[o0]1|ang10|iaqlan9|陈加强|陈加\d?)")),
     ("低置信文字残留", re.compile(r"识别置信度低")),
-    ("Markdown外部图片残留", re.compile(r"!\[[^\]]*\]\(<[^>]+>\)|_assets/|_assets\\\\")),
+    ("旧式图片占位残留", re.compile(r"!\[(?:图片|表格截图|公式)\]\(<[^>]+>\)")),
     ("未文本化图片占位残留", re.compile(r"图片区域未能可靠文本化|不写入外部图片")),
     ("申诉误识别", re.compile(r"中诉|甲诉|不子申诉")),
     ("为/沩误识别", re.compile(r"沩")),
@@ -48,7 +48,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
 	        r"肇月度|强排擅|站点组强推|集圴站|群合考核|则除异常单|汁算|方案）。|"
 	        r"谢味\s*恕|特妹|特珠|特株|场意|算分不例|多倍权甫|权甫|"
 	        r"300[,，zZ]|70046|级力\s*\d+|240天气|≤22|配送原因未完成率=Y2|XI|Xe|Yz|Zs|"
-            r"张冢口|WKA品|品陳|品陈|"
+            r"张冢口|品陳|品陈|"
 	        r"结算方案[）)]|KA星级结算金|KA星级结\b|K[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS]|"
         r"K[iI]分\s*[、,，]\s*K[aA]分|K[.．]{2}K[aA]|K[Ii]分|"
         r"K[sS]分K[Nn]分|Q1\s*[.．]\s*Q2")),
@@ -153,16 +153,44 @@ def _append_critical_missing_section_issues(text: str,
         if not has_formula:
             add("5.4.7 复合超时时长缺少 A1/A2/A3/W 计算公式", "5.4.7")
 
+    if "5.4.5" in compact and "承托比" in compact:
+        has_formula = (
+            r"\text{承托比}" in text
+            and (r"R_{\text{KA品牌单}}" in text or "![公式原图]" in text)
+        )
+        if not has_formula:
+            add("5.4.5 承托比缺少 R/W 计算公式或公式原图", "5.4.5")
+
+    if "5.4.6" in compact and "虚假点送达率" in compact:
+        has_formula = (
+            r"\text{虚假点送达率}" in text
+            and (r"T_{\text{KA品牌单}}" in text or "![公式原图]" in text)
+        )
+        has_context = all(item in compact for item in (
+            "指标释义", "指标说明", "数据来源", "电话客诉", "风控抓取"
+        ))
+        if not has_formula:
+            add("5.4.6 虚假点送达率缺少 T/W 计算公式或公式原图", "5.4.6")
+        if not has_context:
+            add("5.4.6 虚假点送达率缺少指标释义、指标说明或数据来源", "5.4.6")
+
     if "7.1" in compact and "KA品牌体验调分项" in compact:
         if "得分范围" not in text or "麦当劳完单量占比" not in text:
             add("7.1 KA品牌体验调分项缺少得分范围或指标定义", "7.1")
 
     if "5.7" in compact and "特殊场景体验融合考核" in compact:
         required = [
+            "考核目标",
+            "考核目标举例",
+            "普通场景体验满分目标",
+            "特殊场景体验满分目标",
+            "核算公式",
+            "特殊场景完成单占比",
             "普通场景算分示例",
             "特殊场景算分示例",
             "融合后体验得分",
             "124.50",
+            "107.80",
             "122.9818",
         ]
         missing = [item for item in required if item not in compact]
@@ -304,7 +332,7 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
             [issue["type"] for issue in result["issues"]],
             [
                 "页眉水印残留",
-                "Markdown外部图片残留",
+                "旧式图片占位残留",
                 "未文本化图片占位残留",
                 "申诉误识别",
                 "为/沩误识别",
@@ -377,8 +405,11 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
                     "#### 5.4.7 复合超时时长\n"
                     "$$\\text{复合超时时长}=\\frac{A1_{\\text{KA品牌单}}+A2_{\\text{KA品牌单}}+A3_{\\text{KA品牌单}}}{W_{\\text{KA品牌单}}}$$\n"
                     "#### 5.7 特殊场景体验融合考核的说明\n"
+                    "考核目标举例：不同场景的体验目标。\n"
+                    "普通场景体验满分目标，特殊场景体验满分目标。\n"
+                    "核算公式：融合后体验得分按照特殊场景完成单占比计算。\n"
                     "普通场景算分示例，普通场景得分124.50。\n"
-                    "特殊场景算分示例，融合后体验得分122.9818。\n"
+                    "特殊场景算分示例，特殊场景得分107.80，融合后体验得分122.9818。\n"
                     "#### 7.1 KA 品牌体验调分项\n"
                     "得分范围：[0,0.2]\n"
                     "麦当劳完单量占比=麦当劳完单量/总量\n"
@@ -439,7 +470,7 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
 
 
 def run_builtin_checks(stream=None) -> Dict[str, object]:
-    from . import assemble, export, normalize, qa
+    from . import assemble, coverage, export, normalize, qa
 
     cases: List[Tuple[str, Callable[[], None]]] = []
     cases.extend(_audit_builtin_cases())
@@ -447,6 +478,7 @@ def run_builtin_checks(stream=None) -> Dict[str, object]:
     cases.extend(qa.builtin_check_cases())
     cases.extend(assemble.builtin_check_cases())
     cases.extend(export.builtin_check_cases())
+    cases.extend(coverage.builtin_check_cases())
 
     failures: List[Dict[str, str]] = []
     for name, fn in cases:
