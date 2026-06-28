@@ -324,10 +324,7 @@ def _auto_image_is_important(blk: Block) -> bool:
 
 
 def _image_block_exported(blk: Block, markdown_text: str) -> bool:
-    if blk.image_path:
-        name = os.path.basename(blk.image_path)
-        if name and name in markdown_text:
-            return True
+    md_compact = _compact(markdown_text)
     if "formula" in blk.flags and blk.text:
         latex = ""
         try:
@@ -337,14 +334,42 @@ def _image_block_exported(blk: Block, markdown_text: str) -> bool:
             latex = ""
         if latex and latex in markdown_text:
             return True
+        if "公式原文（需核对）" in md_compact and _text_anchors_exported(
+                blk.text, md_compact):
+            return True
+    if "formula" in blk.flags and "公式原文（需核对）" in md_compact:
+        return True
+    if "table_fallback" in blk.flags and "表格结构需核对" in md_compact:
+        return True
+    if "auto_image" in blk.flags and "图示/低置信区域未能可靠文本化" in md_compact:
+        return True
     text = _compact(blk.text or "")
-    if len(text) >= 8 and text[:40] in _compact(markdown_text):
+    if len(text) >= 8 and text[:40] in md_compact:
         return True
     if blk.rows:
         row_text = _compact(" ".join(" ".join(row) for row in blk.rows))
-        if len(row_text) >= 8 and row_text[:40] in _compact(markdown_text):
+        if len(row_text) >= 8 and row_text[:40] in md_compact:
             return True
+        cell_hits = 0
+        for row in blk.rows:
+            for cell in row:
+                token = _compact(cell)
+                if len(token) >= 4 and token[:24] in md_compact:
+                    cell_hits += 1
+                    if cell_hits >= 2:
+                        return True
     return False
+
+
+def _text_anchors_exported(text: str, md_compact: str) -> bool:
+    anchors = []
+    for raw in (text or "").splitlines():
+        token = _compact(raw)
+        if len(token) >= 4:
+            anchors.append(token[:28])
+    if not anchors:
+        return False
+    return any(anchor in md_compact for anchor in anchors)
 
 
 def _check_ka_required_content(markdown_text: str) -> List[str]:
@@ -380,7 +405,7 @@ def _check_ka_required_content(markdown_text: str) -> List[str]:
             continue
         sec_compact = _compact(sec)
         if label not in sec_compact or not _has_formula_or_original(sec):
-            issues.append(f"覆盖审计: {token} {label} 缺少公式或公式原图")
+            issues.append(f"覆盖审计: {token} {label} 缺少可信公式")
 
     sec_546 = section("5.4.6")
     if sec_546:
@@ -402,9 +427,9 @@ def _check_ka_required_content(markdown_text: str) -> List[str]:
 
 def _has_formula_or_original(section_text: str) -> bool:
     compact = _compact(section_text)
+    if "公式原文（需核对）" in compact or "需对照原PDF核对" in compact:
+        return False
     if "$$" in section_text and r"\frac" in section_text:
-        return True
-    if "![公式原图]" in section_text or "公式原图" in compact:
         return True
     return False
 
@@ -606,20 +631,23 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert any("5.4.5" in issue for issue in issues)
         assert any("5.4.6" in issue for issue in issues)
 
-    def case_ka_required_formula_original_image_passes() -> None:
+    def case_ka_required_formula_review_marker_fails() -> None:
         md = (
             "# 2026年6月KA品牌单月度考核制度\n"
             "### 1.站点组体验总得分计算逻辑\n"
             "站点组履约的KA品牌单体验总得分，站点组体验总得分，站点组F，站点组Kn\n"
-            "![公式原图](<a.png>)\n"
+            "**公式原文（需核对）**\n"
+            "站点组体验总得分=站点组F分*F/(F+SUM(Kn*Qn))\n"
             "#### 5.4.5 承托比（适用履约星巴克单的站点组）\n"
-            "承托比\n![公式原图](<b.png>)\n"
+            "承托比\n**公式原文（需核对）**\n承托比=R/W\n"
             "#### 5.4.6 虚假点送达率\n"
-            "虚假点送达率\n![公式原图](<c.png>)\n"
+            "虚假点送达率\n**公式原文（需核对）**\n虚假点送达率=T/W\n"
             "指标释义：虚假点击送达。\n指标说明\n数据来源\n电话客诉\n风控抓取\n"
         )
         issues = _check_ka_required_content(md)
-        assert not [issue for issue in issues if "5.4.5" in issue or "5.4.6" in issue]
+        assert any("站点组体验总得分" in issue for issue in issues)
+        assert any("5.4.5" in issue for issue in issues)
+        assert any("5.4.6" in issue for issue in issues)
 
     return [
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
@@ -628,5 +656,5 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.readability_fails_formula_glued_to_text", case_readability_fails_formula_glued_to_text),
         ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),
         ("coverage.ka_required_formula_missing_fails", case_ka_required_formula_missing_fails),
-        ("coverage.ka_required_formula_original_image_passes", case_ka_required_formula_original_image_passes),
+        ("coverage.ka_required_formula_review_marker_fails", case_ka_required_formula_review_marker_fails),
     ]

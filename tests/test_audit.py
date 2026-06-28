@@ -37,7 +37,7 @@ class AuditTests(unittest.TestCase):
             [issue["type"] for issue in result["issues"]],
             [
                 "页眉水印残留",
-                "Markdown外部图片残留",
+                "旧式图片占位残留",
                 "未文本化图片占位残留",
                 "申诉误识别",
                 "为/沩误识别",

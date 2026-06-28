@@ -24,6 +24,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"(?i)(?:bm[_\\-]*ch|chenj|chenjia|i?ang[o0]l|"
         r"1ang[o0]1|ang10|iaqlan9|陈加强|陈加\d?)")),
     ("低置信文字残留", re.compile(r"识别置信度低")),
+    ("公式需核对", re.compile(r"公式原文（需核对）|需对照原 PDF 核对")),
     ("旧式图片占位残留", re.compile(r"!\[(?:图片|表格截图|公式)\]\(<[^>]+>\)")),
     ("未文本化图片占位残留", re.compile(r"图片区域未能可靠文本化|不写入外部图片")),
     ("申诉误识别", re.compile(r"中诉|甲诉|不子申诉")),
@@ -61,7 +62,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("乱码字符残留", re.compile(r"[�俁仴雲抇讳冏昇銷埃門哭伿怯奂沩亥導抯]")),
 ]
 
-TABLE_FALLBACK_RE = re.compile(r"表格结构识别不稳定|!\[表格截图\]")
+TABLE_FALLBACK_RE = re.compile(r"表格结构识别不稳定|表格结构需核对|!\[表格截图\]")
 SECTION_HEADING_RE = re.compile(r"^#{1,6}\s+")
 
 
@@ -156,21 +157,21 @@ def _append_critical_missing_section_issues(text: str,
     if "5.4.5" in compact and "承托比" in compact:
         has_formula = (
             r"\text{承托比}" in text
-            and (r"R_{\text{KA品牌单}}" in text or "![公式原图]" in text)
+            and r"R_{\text{KA品牌单}}" in text
         )
         if not has_formula:
-            add("5.4.5 承托比缺少 R/W 计算公式或公式原图", "5.4.5")
+            add("5.4.5 承托比缺少 R/W 计算公式", "5.4.5")
 
     if "5.4.6" in compact and "虚假点送达率" in compact:
         has_formula = (
             r"\text{虚假点送达率}" in text
-            and (r"T_{\text{KA品牌单}}" in text or "![公式原图]" in text)
+            and r"T_{\text{KA品牌单}}" in text
         )
         has_context = all(item in compact for item in (
             "指标释义", "指标说明", "数据来源", "电话客诉", "风控抓取"
         ))
         if not has_formula:
-            add("5.4.6 虚假点送达率缺少 T/W 计算公式或公式原图", "5.4.6")
+            add("5.4.6 虚假点送达率缺少 T/W 计算公式", "5.4.6")
         if not has_context:
             add("5.4.6 虚假点送达率缺少指标释义、指标说明或数据来源", "5.4.6")
 
@@ -180,6 +181,10 @@ def _append_critical_missing_section_issues(text: str,
 
     if "5.7" in compact and "特殊场景体验融合考核" in compact:
         required = [
+            "考核方式",
+            "考核指标",
+            "天气等级",
+            "考核规则",
             "考核目标",
             "考核目标举例",
             "普通场景体验满分目标",
@@ -261,8 +266,7 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
               end="", file=sys.stderr, flush=True)
 
     try:
-        result = convert(pdf_path, out_dir, formats=("md",), progress=progress,
-                         debug_layout=True)
+        result = convert(pdf_path, out_dir, formats=("md",), progress=progress)
         print(file=sys.stderr)
     except Exception as e:
         print(file=sys.stderr)
@@ -291,7 +295,6 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
         "source": pdf_path,
         "ok": ok,
         "outputs": result.get("outputs", []),
-        "debug_outputs": result.get("debug_outputs", []),
         "pages": result.get("pages"),
         "blocks": result.get("blocks"),
         "flagged_blocks": result.get("flagged_blocks", 0),
@@ -380,6 +383,36 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
             result = scan_markdown(path)
         _assert_equal(result["issue_count"], 0, "issue_count")
 
+    def case_formula_review_marker_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("**公式原文（需核对）**\n\n客诉虚假点送达率=分子/分母\n")
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("公式需核对" in issue_types, "公式需核对")
+
+    def case_convert_outputs_single_md_without_assets_or_layout() -> None:
+        import fitz
+        from .pipeline import convert
+
+        with tempfile.TemporaryDirectory() as td:
+            pdf_path = os.path.join(td, "sample.pdf")
+            out_dir = os.path.join(td, "out")
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            page.insert_text((40, 80), "单文件 Markdown 输出检查")
+            doc.save(pdf_path)
+            doc.close()
+
+            result = convert(pdf_path, out_dir, formats=("md",))
+            names = os.listdir(out_dir)
+
+        _assert_equal(len(result["outputs"]), 1, "outputs")
+        _assert_true(result["outputs"][0].endswith(".md"), "md output")
+        _assert_false(any("_assets" in name for name in names), "assets output")
+        _assert_false(any("_layout" in name for name in names), "layout output")
+
     def case_critical_sections_missing() -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.md")
@@ -407,6 +440,10 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
                     "#### 5.4.7 复合超时时长\n"
                     "$$\\text{复合超时时长}=\\frac{A1_{\\text{KA品牌单}}+A2_{\\text{KA品牌单}}+A3_{\\text{KA品牌单}}}{W_{\\text{KA品牌单}}}$$\n"
                     "#### 5.7 特殊场景体验融合考核的说明\n"
+                    "考核方式：普通场景和特殊场景分开考核。\n"
+                    "考核指标：虚假点送达率、配送原因未完成率、复合准时率。\n"
+                    "天气等级：10、20、30、40。\n"
+                    "考核规则：按运单首次调度天气等级判定。\n"
                     "考核目标举例：不同场景的体验目标。\n"
                     "普通场景体验满分目标，特殊场景体验满分目标。\n"
                     "核算公式：融合后体验得分按照特殊场景完成单占比计算。\n"
@@ -464,6 +501,8 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("audit.salary_policy_residuals", case_salary_policy_residuals),
         ("audit.normal_formula_not_zero_reversal", case_normal_formula_not_zero_reversal),
         ("audit.normal_y2_variable_allowed", case_normal_y2_variable_allowed),
+        ("audit.formula_review_marker_blocks_pass", case_formula_review_marker_blocks_pass),
+        ("audit.convert_outputs_single_md_without_assets_or_layout", case_convert_outputs_single_md_without_assets_or_layout),
         ("audit.critical_sections_missing", case_critical_sections_missing),
         ("audit.critical_sections_complete", case_critical_sections_complete),
         ("audit.table_readability_regression", case_table_readability_regression),
@@ -472,7 +511,7 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
 
 
 def run_builtin_checks(stream=None) -> Dict[str, object]:
-    from . import assemble, coverage, export, layout_debug, normalize, qa
+    from . import assemble, coverage, export, normalize, qa
 
     def add_module_cases(module) -> None:
         getter = getattr(module, "builtin_check_cases", None)
@@ -481,7 +520,7 @@ def run_builtin_checks(stream=None) -> Dict[str, object]:
 
     cases: List[Tuple[str, Callable[[], None]]] = []
     cases.extend(_audit_builtin_cases())
-    for module in (normalize, qa, assemble, export, coverage, layout_debug):
+    for module in (normalize, qa, assemble, export, coverage):
         add_module_cases(module)
 
     failures: List[Dict[str, str]] = []
@@ -535,7 +574,7 @@ def run_audit(pdf_dir: str, sample_size: int = 4, offset: int = 0,
         "selfcheck": selfcheck,
         "results": results,
     }
-    if not keep_output and ok:
+    if not keep_output:
         shutil.rmtree(out_dir, ignore_errors=True)
     elif not ok:
         report["out_dir"] = out_dir

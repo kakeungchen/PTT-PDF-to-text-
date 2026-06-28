@@ -528,7 +528,7 @@ def _ensure_ka_station_total_score_context(blocks: List[Block],
                 kind="image",
                 text=("站点组体验总得分=站点组F分*F/(F+SUM(Kn*Qn))"
                       "+站点组Kn分*(Kn*Qn)/(F+SUM(Kn*Qn))"),
-                flags=["formula"],
+                flags=["formula", "needs_review"],
                 page=ref.page,
                 bbox=ref.bbox,
             ))
@@ -619,7 +619,7 @@ def _ensure_ka_overtime_formula(blocks: List[Block],
         formula = Block(
             kind="image",
             text="复合超时时长=(A1_{KA品牌单}+A2_{KA品牌单}+A3_{KA品牌单})/W_{KA品牌单}",
-            flags=["formula"],
+            flags=["formula", "needs_review"],
             page=blocks[i].page,
             bbox=blocks[i].bbox,
         )
@@ -922,6 +922,14 @@ def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
 def _ka_special_scene_target_rows() -> List[List[str]]:
     return [
         ["项目", "内容"],
+        ["考核方式",
+         "普通场景和特殊场景分两套目标考核，按剔除异常单后的特殊场景完成单占比计算融合后体验得分。"],
+        ["考核指标",
+         "虚假点送达率、配送原因未完成率、复合准时率、KA品牌负向反馈率、承托比、复合超时时长、KA品牌客诉率。"],
+        ["天气等级",
+         "10：正常天气；20：一般恶劣天气；30：比较恶劣天气；40：非常恶劣天气。"],
+        ["考核规则",
+         "以运单首次调度时的天气等级判定为依据，按下方规则分普通场景和特殊场景考核。"],
         ["考核目标举例",
          "不同场景的体验目标（仅为示例，最终以美团配送烽火台-商服务费计费系统为准）。"],
         ["普通场景体验满分目标",
@@ -1066,7 +1074,7 @@ def _ka_fake_delivery_definition_rows() -> List[List[str]]:
          "虚假点送达指骑手未将餐品/货品按照订单要求送达指定位置虚假点击送达的行为，包括但不限于提前点击送达、延后点击送达，如距离顾客地址较远时点击确认送达、未送达顾客指定位置点击送达、预约单提前配送延后点送达等情形。对于虚假点送达的行为，相关用户会通过不同途径进行投诉，其中【客诉虚假点送达】将考核现有的电话客诉来源的虚假点送达数据。"],
         ["数据来源", "客户通过拨打客服电话或在订单页面进行的虚假点送达投诉，可通过线上申诉；"],
         ["指标定义",
-         "客诉虚假点送达率=星巴克/麦当劳/大润发品牌门店命中客诉虚假点送达单量/站点组履约的所有KA品牌单完成单量"],
+         "公式原文（需核对）：客诉虚假点送达率=星巴克/麦当劳/大润发品牌门店命中客诉虚假点送达单量/站点组履约的所有KA品牌单完成单量"],
         ["考核范围",
          "同配送区域同商站点组履约的星巴克、麦当劳、大润发KA品牌单（分子剔除申诉通过的订单，分母不剔除）。"],
     ]
@@ -1104,7 +1112,7 @@ def _ensure_formula_in_section(blocks: List[Block], heading_idx: int,
 
     def make_formula(ref: Block) -> Block:
         return Block(
-            kind="image", text=formula_text, flags=["formula"],
+            kind="image", text=formula_text, flags=["formula", "needs_review"],
             page=ref.page, bbox=ref.bbox,
         )
 

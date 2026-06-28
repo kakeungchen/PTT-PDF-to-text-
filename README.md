@@ -4,7 +4,7 @@
 
 # ptt — PDF to Text
 
-**Turn any PDF into clean Word & Markdown. 100% on-device.**
+**Turn any PDF into clean Markdown. 100% on-device.**
 
 English · [简体中文](README.zh-CN.md)
 
@@ -30,11 +30,10 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 | **Watermark removal** | Diagonal / light-colored security watermarks and repeated confidentiality banners are stripped automatically |
 | **Header & footer removal** | Doc IDs, page numbers, logos and periodic repeats — including the "virtual pages" inside stitched long screenshots |
 | **Table reconstruction** | Simple tables stay as Markdown tables; cross-page, merged-cell, multi-header, and long-description tables are rewritten into readable grouped text |
-| **Formulas & diagrams** | Content OCR can't faithfully linearize (fractions, subscripts, flowcharts) is **embedded as pixel-perfect crops** instead of wrong text |
-| **Layout ledger** | Optional MinerU-style debug output records each text / table / formula / image region with bbox, order, confidence, and export status |
+| **Formulas & diagrams** | Content OCR can't faithfully linearize (fractions, subscripts, flowcharts) is marked as **formula text requiring review** instead of guessed as correct text |
 | **Figure text, structured** | Text inside diagrams is re-laid-out by geometry into readable tables — both humans and AI agents can parse it |
-| **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom; headings, formulas, key numbers, and metric names are checked for source-to-output coverage; anything still uncertain is **explicitly flagged** (yellow highlight in Word) |
-| **Clean output** | Temp files are deleted automatically — you get just the `.docx` / `.md` (plus the image folder Markdown references) |
+| **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom; headings, formulas, key numbers, and metric names are checked for source-to-output coverage; anything still uncertain is **explicitly flagged** |
+| **Clean output** | Temp crops and intermediate assets are deleted automatically — the default conversion leaves one `.md` file |
 | **Agent-friendly** | CLI with JSON output mode: progress on stderr, machine-readable results on stdout |
 
 ## Quick start
@@ -49,14 +48,14 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 ### CLI / AI agents
 
 ```bash
-# Basic
-.venv/bin/python -m ptt.cli file.pdf -o output_dir -f md docx
+# Basic: one Markdown file
+.venv/bin/python -m ptt.cli file.pdf -o output_dir
 
 # Agent mode: JSON to stdout, progress to stderr
 .venv/bin/python -m ptt.cli file.pdf --json
 
-# Debug layout: write file_layout.json and file_layout/page-001.png overlays
-.venv/bin/python -m ptt.cli file.pdf -o output_dir --debug-layout
+# Optional Word compatibility output
+.venv/bin/python -m ptt.cli file.pdf -o output_dir -f md docx
 ```
 
 The JSON includes `outputs`, `warnings` (what was stripped / auto-corrected), `qa_issues` (locations needing human review) and `flagged_blocks`.
@@ -68,11 +67,10 @@ PDF ──▶ per-page type detection
      ──▶ text layer extraction  /  tiled Vision OCR (1800px strips, overlap dedup)
      ──▶ periodic header/footer & watermark band removal
      ──▶ ruling-based table grid reconstruction (cross-page merge)
-     ──▶ diagram / formula region detection → pixel-perfect crops
-     ──▶ optional layout ledger / overlay images for text · table · formula · image regions
+     ──▶ diagram / formula region detection → internal coverage ledger
      ──▶ reading-order assembly (headings · paragraphs · tables · figures)
      ──▶ QA: 2× re-OCR cross-check · frequency-vote typo repair · coverage audit · readability audit
-     ──▶ Word (.docx) / Markdown (.md)
+     ──▶ Markdown (.md), optionally Word (.docx)
 ```
 
 No ML model downloads, no PyTorch — OCR is Apple's Vision framework, which ships with macOS. That's why the whole repo is ~40 KB.
@@ -80,6 +78,6 @@ No ML model downloads, no PyTorch — OCR is Apple's Vision framework, which shi
 ## Honest limitations
 
 - Dark watermarks burned into scanned images can't always be fully removed (light/text watermarks work well).
-- Tiny subscript glyphs (e.g. K₁) are at the edge of Vision's ability — the correct notation is always preserved in the embedded formula image.
-- Text inside app-screenshot evidence images is best-effort: treat the embedded image as the source of truth, the text as a search index.
+- Tiny subscript glyphs (e.g. K₁) are at the edge of Vision's ability — uncertain formulas are marked for review and block a clean audit pass.
+- Text inside app-screenshot evidence images is best-effort: uncertain regions are explicitly flagged rather than silently guessed.
 - Anything the tool isn't sure about is flagged, never silently guessed.

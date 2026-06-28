@@ -6,7 +6,7 @@ from typing import Callable, List, Optional
 
 import fitz
 
-from . import assemble, coverage, layout_debug, qa, text_extract
+from . import assemble, coverage, qa, text_extract
 from .export import export_docx, export_markdown
 from .models import Block, DocResult
 from .normalize import normalize_blocks
@@ -34,9 +34,8 @@ def _page_provider(doc: fitz.Document, pno: int) -> StripProvider:
     return RenderProvider(page)
 
 
-def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
-            progress: Optional[ProgressFn] = None,
-            debug_layout: bool = False) -> dict:
+def convert(pdf_path: str, out_dir: str, formats=("md",),
+            progress: Optional[ProgressFn] = None) -> dict:
     """转换单个 PDF。返回结果摘要 dict（供 CLI/GUI/Agent 使用）。"""
     def report(msg, frac):
         if progress:
@@ -137,11 +136,6 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         export_docx(result, p)
         outputs.append(p)
 
-    debug_outputs: List[str] = []
-    if debug_layout:
-        debug_outputs = layout_debug.export_debug_layout(
-            pdf_path, result, out_dir, safe)
-
     md_paths = [p for p in outputs if p.endswith(".md")]
     if md_paths:
         try:
@@ -160,9 +154,9 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         if "表格疑似列错位" not in issue
     ]
 
-    # Markdown 可能引用公式/图示原图作为保真兜底；仅在没有 Markdown 输出时
-    # 清理 assets。docx 图片会在保存时内嵌。
-    if "md" not in formats and os.path.isdir(assets_dir):
+    # Markdown 只输出单文件；裁切图仅作 OCR/复核中间产物。
+    # docx 图片在保存时已内嵌，也可以安全清理。
+    if os.path.isdir(assets_dir):
         shutil.rmtree(assets_dir, ignore_errors=True)
     report("完成", 1.0)
     doc.close()
@@ -170,7 +164,6 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
     return {
         "source": pdf_path,
         "outputs": outputs,
-        "debug_outputs": debug_outputs,
         "pages": n,
         "blocks": len(result.blocks),
         "warnings": result.warnings,
