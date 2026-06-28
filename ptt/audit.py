@@ -472,13 +472,15 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
 def run_builtin_checks(stream=None) -> Dict[str, object]:
     from . import assemble, coverage, export, normalize, qa
 
+    def add_module_cases(module) -> None:
+        getter = getattr(module, "builtin_check_cases", None)
+        if getter:
+            cases.extend(getter())
+
     cases: List[Tuple[str, Callable[[], None]]] = []
     cases.extend(_audit_builtin_cases())
-    cases.extend(normalize.builtin_check_cases())
-    cases.extend(qa.builtin_check_cases())
-    cases.extend(assemble.builtin_check_cases())
-    cases.extend(export.builtin_check_cases())
-    cases.extend(coverage.builtin_check_cases())
+    for module in (normalize, qa, assemble, export, coverage):
+        add_module_cases(module)
 
     failures: List[Dict[str, str]] = []
     for name, fn in cases:
