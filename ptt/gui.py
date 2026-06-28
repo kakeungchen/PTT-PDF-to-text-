@@ -77,9 +77,10 @@ class Worker(QThread):
     all_done = Signal(int, int)
     log = Signal(str)
 
-    def __init__(self, files, formats, out_dir):
+    def __init__(self, files, formats, out_dir, debug_layout=False):
         super().__init__()
         self.files, self.formats, self.out_dir = files, formats, out_dir
+        self.debug_layout = debug_layout
 
     def run(self):
         ok = fail = 0
@@ -92,10 +93,13 @@ class Worker(QThread):
                 self.log.emit(f"▸ 开始转换 {name}")
                 res = convert(path, out_dir, formats=self.formats,
                               progress=lambda m, f: self.progress.emit(
-                                  f"({i+1}/{n}) {name} · {m}", (i + f) / n))
+                                  f"({i+1}/{n}) {name} · {m}", (i + f) / n),
+                              debug_layout=self.debug_layout)
                 ok += 1
                 for o in res["outputs"]:
                     self.log.emit(f"  ✓ {o}")
+                for o in res.get("debug_outputs", []):
+                    self.log.emit(f"  ✓ 版面标注: {o}")
                 if res["flagged_blocks"]:
                     self.log.emit(f"  ⚠ {res['flagged_blocks']} 处低置信内容已标注"
                                   "（Word 中为黄色高亮），建议人工核对")
@@ -192,8 +196,10 @@ class MainWindow(QMainWindow):
         self.cb_docx.setChecked(True)
         self.cb_md = QCheckBox("Markdown (.md)")
         self.cb_md.setChecked(True)
+        self.cb_debug = QCheckBox("生成版面标注")
         opts.addWidget(self.cb_docx)
         opts.addWidget(self.cb_md)
+        opts.addWidget(self.cb_debug)
         opts.addStretch()
         btn_add = QPushButton("＋ 添加文件")
         btn_add.setObjectName("ghost")
@@ -304,7 +310,8 @@ class MainWindow(QMainWindow):
         self.last_out_dirs = ({self.custom_out} if self.custom_out else
                               {os.path.join(os.path.dirname(os.path.abspath(p)), "转换结果")
                                for p in self.files})
-        self.worker = Worker(list(self.files), tuple(formats), self.custom_out)
+        self.worker = Worker(list(self.files), tuple(formats), self.custom_out,
+                             self.cb_debug.isChecked())
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.logbox.append)
         self.worker.all_done.connect(self.on_done)

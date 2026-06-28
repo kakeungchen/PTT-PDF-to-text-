@@ -21,6 +21,8 @@ def main(argv=None):
                     help="输出目录（默认：与源文件同目录下的『转换结果』）")
     ap.add_argument("-f", "--formats", nargs="+", default=["md", "docx"],
                     choices=["md", "docx"], help="输出格式（默认两种都出）")
+    ap.add_argument("--debug-layout", action="store_true",
+                    help="额外输出版面标注 JSON 和 PNG，用于排查文本/表格/公式区域")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出结果（Agent 模式）")
     args = ap.parse_args(argv)
 
@@ -40,7 +42,8 @@ def main(argv=None):
 
         try:
             res = convert(path, out_dir, formats=tuple(args.formats),
-                          progress=progress)
+                          progress=progress,
+                          debug_layout=args.debug_layout)
             print(file=sys.stderr)
             results.append(res)
             if not args.json:
@@ -48,6 +51,8 @@ def main(argv=None):
                 label = "转换完成" if res.get("quality_ok", True) else "转换完成，但质量审计需复核"
                 print(f"{mark} {label}: {path}")
                 for o in res["outputs"]:
+                    print(f"   -> {o}")
+                for o in res.get("debug_outputs", []):
                     print(f"   -> {o}")
                 if res["flagged_blocks"]:
                     print(f"   ⚠ {res['flagged_blocks']} 处低置信内容已标注，建议人工核对")

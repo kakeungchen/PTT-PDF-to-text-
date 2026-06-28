@@ -31,6 +31,7 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 | **Header & footer removal** | Doc IDs, page numbers, logos and periodic repeats — including the "virtual pages" inside stitched long screenshots |
 | **Table reconstruction** | Simple tables stay as Markdown tables; cross-page, merged-cell, multi-header, and long-description tables are rewritten into readable grouped text |
 | **Formulas & diagrams** | Content OCR can't faithfully linearize (fractions, subscripts, flowcharts) is **embedded as pixel-perfect crops** instead of wrong text |
+| **Layout ledger** | Optional MinerU-style debug output records each text / table / formula / image region with bbox, order, confidence, and export status |
 | **Figure text, structured** | Text inside diagrams is re-laid-out by geometry into readable tables — both humans and AI agents can parse it |
 | **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom; headings, formulas, key numbers, and metric names are checked for source-to-output coverage; anything still uncertain is **explicitly flagged** (yellow highlight in Word) |
 | **Clean output** | Temp files are deleted automatically — you get just the `.docx` / `.md` (plus the image folder Markdown references) |
@@ -53,6 +54,9 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 
 # Agent mode: JSON to stdout, progress to stderr
 .venv/bin/python -m ptt.cli file.pdf --json
+
+# Debug layout: write file_layout.json and file_layout/page-001.png overlays
+.venv/bin/python -m ptt.cli file.pdf -o output_dir --debug-layout
 ```
 
 The JSON includes `outputs`, `warnings` (what was stripped / auto-corrected), `qa_issues` (locations needing human review) and `flagged_blocks`.
@@ -65,6 +69,7 @@ PDF ──▶ per-page type detection
      ──▶ periodic header/footer & watermark band removal
      ──▶ ruling-based table grid reconstruction (cross-page merge)
      ──▶ diagram / formula region detection → pixel-perfect crops
+     ──▶ optional layout ledger / overlay images for text · table · formula · image regions
      ──▶ reading-order assembly (headings · paragraphs · tables · figures)
      ──▶ QA: 2× re-OCR cross-check · frequency-vote typo repair · coverage audit · readability audit
      ──▶ Word (.docx) / Markdown (.md)

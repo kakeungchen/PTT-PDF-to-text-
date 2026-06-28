@@ -160,6 +160,8 @@ def normalize_text(text: str, context: str = "text") -> Tuple[str, List[str]]:
     sub(r'站点I\s*D', '站点ID', '站点ID')
     sub(r'站点\s*(?:1\s*[习号]?\s*D|一\s*D|l\s*D)', '站点ID', '站点ID')
     sub(r'(站点\s*)A[Iil](?=[、,，\s])', r'\1A1', '站点A1形近字')
+    sub(r'(?<=普通场景体验得分\*)[（(]\s*1\s+t\s*[）)]',
+        '（1-t）', '特殊场景融合公式 1-t')
     sub(r'(?<![A-Za-z0-9])A(\d)[.．]\s*A(\d)(?![A-Za-z0-9])',
         r'A\1、A\2', '站点编号分隔符')
     sub(r'\bK[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS][.．]{2}\s*K[aA]\b',
@@ -1879,6 +1881,12 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert "融合后体验得分" in text
         assert "122.9818" in text
 
+    def case_special_scene_formula_one_minus_t() -> None:
+        text = "体验指标得分=特殊场景体验得分*t＋普通场景体验得分*（1 t）具体方案详见：5.7"
+        fixed_text, notes = normalize_text(text)
+        assert "（1-t）" in fixed_text
+        assert any("特殊场景融合公式 1-t" in note for note in notes)
+
     return [
         ("normalize.sigma_formula_context", case_sigma_formula_context),
         ("normalize.sigma_missing_around_rate_formula", case_sigma_missing_around_rate_formula),
@@ -1895,4 +1903,5 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("normalize.table_suspect_marks_block", case_table_suspect_marks_block),
         ("normalize.nested_weather_policy_table_repaired", case_nested_weather_policy_table_repaired),
         ("normalize.ka_special_scene_fusion_repaired", case_ka_special_scene_fusion_repaired),
+        ("normalize.special_scene_formula_one_minus_t", case_special_scene_formula_one_minus_t),
     ]

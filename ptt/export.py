@@ -57,11 +57,18 @@ def _readable_text_lines(text: str) -> List[str]:
     text = re.sub(r'\s*<br\s*/?>\s*', "\n", text, flags=re.I)
     text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|其中[:：]|'
                   r'指标定义\d*[:：]|计算公式[:：]|核算公式[:：]|'
-                  r'计分规则\d*[:：]|数据来源[:：]|分数计算规则[:：]))',
+                  r'计分规则\d*[:：]|数据来源[:：]|指标说明[:：]|'
+                  r'考核范围[:：]|数据获取方式[:：]|分数计算规则[:：]))',
+                  "\n", text)
+    text = re.sub(r'(?<!^)(?=(?:举例[:：]|示例[:：]))', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=[①②③④⑤⑥⑦⑧⑨]\s*)', "\n", text)
+    text = re.sub(r'(?<!^)(?=(?:[①②③④⑤⑥⑦⑧⑨]|[1-9][）)]|[1-9][.．])\s*'
+                  r'(?:当|参与|同商|考核|数据|电话|风控|不满意|如|若))',
                   "\n", text)
     text = re.sub(r'(?<!^)(?=(?:麦当劳|肯德基|必胜客)完单量占比=)', "\n", text)
     text = re.sub(r'(?<!^)(?=30分钟内送达订单占比（)', "\n", text)
     text = re.sub(r'(?<!^)(?=品牌方口径准时率（)', "\n", text)
+    text = re.sub(r'(?<=[）)])(?=具体方案详见)', "\n", text)
     out: List[str] = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -76,17 +83,37 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
         return False
     ncol = max(len(r) for r in rows_data)
     padded = [r + [""] * (ncol - len(r)) for r in rows_data]
+    row_count = len(padded)
+    cell_texts = [c.strip() for r in padded for c in r if c.strip()]
+    max_cell_len = max((len(c) for c in cell_texts), default=0)
+    joined = " ".join(cell_texts)
+    blank_first_col = sum(1 for r in padded[1:] if not r[0].strip())
+    header_joined = " ".join(c.strip() for c in padded[0] if c.strip())
+    policy_like = re.search(
+        r"释义|说明|数据来源|考核范围|查询路径|申诉|规则|事件|细则|管理目标|补充说明|"
+        r"参考指标|指标定义|计分|核算|公式",
+        joined,
+    )
+
+    if ncol <= 1 and (row_count > 1 or max_cell_len > 40):
+        return True
     if ncol > 5:
         return True
     if any("\n" in c or "<br" in c.lower() for r in padded for c in r):
         return True
-    if any(len(c) > 90 for r in padded for c in r):
+    if ncol == 2 and policy_like and max_cell_len > 60:
         return True
-    if ncol >= 4 and any(
-            any(term in c for term in ("指标", "目标", "公式", "权重", "得分"))
-            for r in padded[:2] for c in r):
+    if ncol in (2, 3) and max_cell_len > 85 and policy_like:
         return True
-    if ncol >= 3 and any(not r[0].strip() for r in padded[1:]):
+    if ncol >= 3 and re.search(r"释义|数据来源|事件细则|查询路径", header_joined) and max_cell_len > 45:
+        return True
+    if ncol <= 5 and max_cell_len <= 90 and blank_first_col == 0:
+        return False
+    if max_cell_len > 140:
+        return True
+    if row_count >= 3 and blank_first_col >= max(1, row_count // 3):
+        return True
+    if ncol >= 3 and re.search(r"合并|多层|普通场景|特殊场景|融合后|计分规则", joined):
         return True
     return False
 
@@ -130,7 +157,11 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
         if pairs:
             one_line = "；".join(f"{label}：{'；'.join(value_lines)}"
                                  for label, value_lines in pairs)
-            if len(one_line) <= 220:
+            structured_labels = any(
+                re.search(r"参考指标|释义|数据来源|说明|考核范围|查询路径", label)
+                for label, _ in pairs
+            )
+            if not structured_labels and len(one_line) <= 220:
                 lines.append("- " + _md_escape_text(one_line))
             else:
                 first = True
@@ -620,6 +651,16 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "| 指标 | 值 |" in text
         assert "![表格截图]" not in text
 
+    def case_simple_four_column_table_stays_markdown_table() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["数据", "查询路径", "负责人", "备注"],
+                ["KA品牌相关考核指标数据", "烽火台-商服务费计费系统", "渠道经理", "每月更新"],
+            ])
+        ]))
+        assert "| 数据 | 查询路径 | 负责人 | 备注 |" in text
+        assert "- 数据：" not in text
+
     def case_image_table_preserves_original_when_available() -> None:
         with tempfile.TemporaryDirectory() as td:
             img_dir = os.path.join(td, "out_assets")
@@ -636,6 +677,45 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "| 数据 | 查询路径 |" in text
         assert "![表格原图]" in text
         assert "out_assets/table.png" in text
+
+    def case_long_policy_table_exports_grouped_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["维度", "说明"],
+                ["指标说明",
+                 "对于虚假点送达的行为，相关用户会通过不同途径进行投诉，"
+                 "包括但不限于电话投诉、风控抓取、用户 app 端投诉等，"
+                 "方案将考核现有的电话客诉、风控抓取、不满意评价抓取3个来源。"],
+            ])
+        ]))
+        assert "**指标说明**" in text
+        assert "| 维度 | 说明 |" not in text
+
+    def case_definition_table_with_long_source_exports_grouped_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["参考指标", "释义", "数据来源"],
+                [
+                    "KA品牌客诉单（KS）",
+                    "因配送过程中存在未送指定位置、送达不通知、餐商品洒漏/货损/送错/少送、提前点送达、服务态度不佳等情况导致投诉。",
+                    "KA品牌方回传给美团平台的客诉数据，客诉明细数据可联系渠道经理获取。",
+                ],
+            ])
+        ]))
+        assert "| 参考指标 | 释义 | 数据来源 |" not in text
+        assert "- 参考指标：KA品牌客诉单" in text
+        assert "数据来源：KA品牌方回传给美团平台的客诉数据" in text
+        assert "。；数据来源" not in text
+
+    def case_single_column_collapsed_table_exports_grouped_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["培训管理目标"],
+                ["专送骑手 专送站长 城市经理 招聘人员 新人训 在岗训 专项训 组织规则 过程指标 考核结果"],
+            ])
+        ]))
+        assert "| 培训管理目标 |" not in text
+        assert "**培训管理目标**" in text
 
     def case_complex_table_exports_readable_blocks_without_br() -> None:
         text = render_text(DocResult(blocks=[
@@ -668,6 +748,10 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.ka_weighted_example_formula_keeps_numbers", case_ka_weighted_example_formula_keeps_numbers),
         ("export.ka_formula_recovery", case_ka_formula_recovery),
         ("export.textual_image_table_exports_table_without_link", case_textual_image_table_exports_table_without_link),
+        ("export.simple_four_column_table_stays_markdown_table", case_simple_four_column_table_stays_markdown_table),
         ("export.image_table_preserves_original_when_available", case_image_table_preserves_original_when_available),
+        ("export.long_policy_table_exports_grouped_text", case_long_policy_table_exports_grouped_text),
+        ("export.definition_table_with_long_source_exports_grouped_text", case_definition_table_with_long_source_exports_grouped_text),
+        ("export.single_column_collapsed_table_exports_grouped_text", case_single_column_collapsed_table_exports_grouped_text),
         ("export.complex_table_exports_readable_blocks_without_br", case_complex_table_exports_readable_blocks_without_br),
     ]

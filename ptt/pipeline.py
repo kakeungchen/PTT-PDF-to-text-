@@ -6,7 +6,7 @@ from typing import Callable, List, Optional
 
 import fitz
 
-from . import assemble, coverage, qa, text_extract
+from . import assemble, coverage, layout_debug, qa, text_extract
 from .export import export_docx, export_markdown
 from .models import Block, DocResult
 from .normalize import normalize_blocks
@@ -35,7 +35,8 @@ def _page_provider(doc: fitz.Document, pno: int) -> StripProvider:
 
 
 def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
-            progress: Optional[ProgressFn] = None) -> dict:
+            progress: Optional[ProgressFn] = None,
+            debug_layout: bool = False) -> dict:
     """转换单个 PDF。返回结果摘要 dict（供 CLI/GUI/Agent 使用）。"""
     def report(msg, frac):
         if progress:
@@ -136,6 +137,11 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
         export_docx(result, p)
         outputs.append(p)
 
+    debug_outputs: List[str] = []
+    if debug_layout:
+        debug_outputs = layout_debug.export_debug_layout(
+            pdf_path, result, out_dir, safe)
+
     md_paths = [p for p in outputs if p.endswith(".md")]
     if md_paths:
         try:
@@ -164,6 +170,7 @@ def convert(pdf_path: str, out_dir: str, formats=("md", "docx"),
     return {
         "source": pdf_path,
         "outputs": outputs,
+        "debug_outputs": debug_outputs,
         "pages": n,
         "blocks": len(result.blocks),
         "warnings": result.warnings,

@@ -261,7 +261,8 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
               end="", file=sys.stderr, flush=True)
 
     try:
-        result = convert(pdf_path, out_dir, formats=("md",), progress=progress)
+        result = convert(pdf_path, out_dir, formats=("md",), progress=progress,
+                         debug_layout=True)
         print(file=sys.stderr)
     except Exception as e:
         print(file=sys.stderr)
@@ -290,6 +291,7 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
         "source": pdf_path,
         "ok": ok,
         "outputs": result.get("outputs", []),
+        "debug_outputs": result.get("debug_outputs", []),
         "pages": result.get("pages"),
         "blocks": result.get("blocks"),
         "flagged_blocks": result.get("flagged_blocks", 0),
@@ -470,7 +472,7 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
 
 
 def run_builtin_checks(stream=None) -> Dict[str, object]:
-    from . import assemble, coverage, export, normalize, qa
+    from . import assemble, coverage, export, layout_debug, normalize, qa
 
     def add_module_cases(module) -> None:
         getter = getattr(module, "builtin_check_cases", None)
@@ -479,7 +481,7 @@ def run_builtin_checks(stream=None) -> Dict[str, object]:
 
     cases: List[Tuple[str, Callable[[], None]]] = []
     cases.extend(_audit_builtin_cases())
-    for module in (normalize, qa, assemble, export, coverage):
+    for module in (normalize, qa, assemble, export, coverage, layout_debug):
         add_module_cases(module)
 
     failures: List[Dict[str, str]] = []
@@ -533,8 +535,10 @@ def run_audit(pdf_dir: str, sample_size: int = 4, offset: int = 0,
         "selfcheck": selfcheck,
         "results": results,
     }
-    if not keep_output:
+    if not keep_output and ok:
         shutil.rmtree(out_dir, ignore_errors=True)
+    elif not ok:
+        report["out_dir"] = out_dir
     return report
 
 

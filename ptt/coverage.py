@@ -12,7 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import fitz
 
-from .export import export_markdown
+from .export import _table_is_complex, export_markdown
 from .models import Block, DocResult
 
 
@@ -81,6 +81,7 @@ def audit_pdf_markdown_coverage(pdf_path: str,
     source_text = _source_text(pdf_path, result.blocks)
     issues: List[str] = []
     issues.extend(_check_markdown_readability(markdown_text))
+    issues.extend(_check_table_block_rendering(result.blocks, markdown_text))
     issues.extend(_check_image_block_coverage(result.blocks, markdown_text))
     issues.extend(_check_ka_required_content(markdown_text))
     issues.extend(_check_section_coverage(source_text, markdown_text))
@@ -272,6 +273,41 @@ def _check_image_block_coverage(blocks: List[Block],
         page = (blk.page or 0) + 1
         issues.append(f"覆盖审计: 第{page}页图像/公式区域未输出 block={idx}")
     return issues
+
+
+def _check_table_block_rendering(blocks: List[Block],
+                                 markdown_text: str) -> List[str]:
+    issues: List[str] = []
+    for idx, blk in enumerate(blocks):
+        if not blk.rows:
+            continue
+        if _table_is_complex(blk.rows):
+            continue
+        if _standard_table_rendered(blk.rows, markdown_text):
+            continue
+        page = (blk.page or 0) + 1
+        bbox = ",".join(str(round(float(v), 1)) for v in blk.bbox)
+        issues.append(
+            f"覆盖审计: 第{page}页标准表格未以 Markdown 表格输出 "
+            f"block={idx} bbox=[{bbox}]"
+        )
+    return issues
+
+
+def _standard_table_rendered(rows: List[List[str]], markdown_text: str) -> bool:
+    if not rows:
+        return False
+    header = [c.strip() for c in rows[0] if c.strip()]
+    if not header:
+        return False
+    pipe_lines = [line for line in markdown_text.splitlines()
+                  if line.strip().startswith("|") and line.strip().endswith("|")]
+    header_needles = [_compact(c) for c in header[:min(3, len(header))]]
+    for line in pipe_lines:
+        compact_line = _compact(line)
+        if all(needle and needle in compact_line for needle in header_needles):
+            return True
+    return False
 
 
 def _auto_image_is_important(blk: Block) -> bool:
@@ -486,6 +522,12 @@ def _check_markdown_readability(markdown_text: str) -> List[str]:
             issues.append(f"排版审计: 第{idx}行存在密集换行标记")
         if len(stripped) > 420 and not stripped.startswith("$$"):
             issues.append(f"排版审计: 第{idx}行过长，疑似挤成一团")
+        if "$$" in stripped and stripped != "$$" and not (
+                stripped.startswith("$$") and stripped.endswith("$$")):
+            issues.append(f"排版审计: 第{idx}行公式和正文粘连")
+        if re.search(r"[。；;]\s*(?:举例|示例|其中|注[:：]|指标说明|数据来源|考核范围)[:：]",
+                     stripped):
+            issues.append(f"排版审计: 第{idx}行说明段落疑似未换行")
         if re.search(r"\|\s*[^|\n]{90,}\s*\|", stripped):
             issues.append(f"排版审计: 第{idx}行表格单元格过长，建议转为分组文本")
     return issues
@@ -537,6 +579,21 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         issues = _check_markdown_readability("长句" * 230)
         assert issues and "过长" in issues[0]
 
+    def case_readability_fails_formula_glued_to_text() -> None:
+        issues = _check_markdown_readability(
+            "注意：$$\\text{承托比}=\\frac{R}{W}$$举例：后续说明"
+        )
+        assert any("公式和正文粘连" in issue for issue in issues)
+
+    def case_standard_table_rendering_required() -> None:
+        blocks = [Block(kind="table", rows=[
+            ["数据", "查询路径", "负责人"],
+            ["KA品牌相关考核指标数据", "烽火台", "渠道经理"],
+        ])]
+        assert _check_table_block_rendering(blocks, "数据：KA品牌相关考核指标数据")
+        md = "| 数据 | 查询路径 | 负责人 |\n|---|---|---|\n| KA品牌相关考核指标数据 | 烽火台 | 渠道经理 |\n"
+        assert _check_table_block_rendering(blocks, md) == []
+
     def case_ka_required_formula_missing_fails() -> None:
         md = (
             "# 2026年6月KA品牌单月度考核制度\n"
@@ -568,6 +625,8 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
         ("coverage.section_complete_passes", case_section_complete_passes),
         ("coverage.readability_fails_long_line", case_readability_fails_long_line),
+        ("coverage.readability_fails_formula_glued_to_text", case_readability_fails_formula_glued_to_text),
+        ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),
         ("coverage.ka_required_formula_missing_fails", case_ka_required_formula_missing_fails),
         ("coverage.ka_required_formula_original_image_passes", case_ka_required_formula_original_image_passes),
     ]
