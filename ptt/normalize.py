@@ -940,9 +940,99 @@ def _repair_ka_special_scene_fusion_layout(blocks: List[Block],
             continue
 
         ref = blocks[i + 1] if i + 1 < end else blocks[i]
-        blocks[i + 1:end] = _ka_special_scene_fusion_blocks(ref)
-        counter["KA特殊场景融合完整章节重排"] += 1
+        section_blocks = blocks[i + 1:end]
+        raw_detail_blocks = _ka_57_preserved_rule_detail_blocks(section_blocks, ref)
+        base_blocks = _ka_special_scene_fusion_blocks(ref)
+        replacement = base_blocks[:1] + raw_detail_blocks + base_blocks[1:]
+        blocks[i + 1:end] = replacement
+        counter["KA特殊场景融合补充重排"] += 1
+        if raw_detail_blocks:
+            counter["KA特殊场景融合原始规则块保留"] += len(raw_detail_blocks)
         i = _next_heading_index(blocks, i + 1)
+
+
+def _ka_57_preserved_rule_detail_blocks(section_blocks: List[Block],
+                                        ref: Block) -> List[Block]:
+    """Extract the real 5.7 rule table before replacing broken example layout.
+
+    The raw OCR block often contains both the top rule table and later example
+    fragments. We keep the rule rows as their own table instead of discarding
+    the whole block just because the example part is noisy.
+    """
+    for block in section_blocks:
+        if not block.rows:
+            continue
+        rows = [list(row) for row in block.rows]
+        if not (_repair_ka_scene_policy_table(rows)
+                or _ka_57_is_structured_rule_detail_rows(rows)):
+            continue
+        return [
+            Block(
+                kind="para",
+                text="考核规则明细：",
+                page=block.page,
+                bbox=block.bbox,
+            ),
+            Block(
+                kind="table",
+                rows=rows,
+                page=block.page,
+                bbox=block.bbox,
+                confidence=block.confidence,
+                flags=["ka_57_raw_rule_detail"],
+            ),
+        ]
+
+    preserved: List[Block] = []
+    for block in section_blocks:
+        if _ka_57_should_preserve_raw_detail_block(block):
+            preserved.append(block)
+    return preserved
+
+
+def _ka_57_is_structured_rule_detail_rows(rows: List[List[str]]) -> bool:
+    if not rows:
+        return False
+    header = [c.strip() for c in rows[0]]
+    if header[:5] != ["类型", "项目/指标", "普通场景考核", "特殊场景考核", "备注"]:
+        return False
+    flat = re.sub(r'\s+', '', " ".join(" ".join(c for c in row if c) for row in rows))
+    return bool("规则" in flat and "距离≤3公里" in flat
+                and "距离>3公里" in flat and "40天气免责" in flat
+                and "复合超时时长" in flat)
+
+
+def _ka_57_should_preserve_raw_detail_block(block: Block) -> bool:
+    text = _block_text(block)
+    compact = re.sub(r'\s+', '', text)
+    if not compact:
+        return False
+    broken_example = (
+        "站点组A麦当劳品" in text
+        or "牌特殊场景算分示例" in text
+        or re.search(r'融合后体\s+验得分', text)
+    )
+    detail_terms = (
+        "普通场景考核", "特殊场景考核", "普通场景", "特殊场景",
+        "备注", "40天气免责", "240天气免责", "HD尾单", "专送兜底",
+        "距离≤3公里", "距离<3公里", "距离>3公里", "距离≥3公里",
+        "天气等级为10", "天气等级为20", "天气等级为30", "天气等级20",
+        "恶劣天气单", "正常天气单",
+    )
+    metric_terms = (
+        "KA品牌负向反馈率", "负向反馈率", "虚假点送达率", "虚假点送达",
+        "配送原因未完成率", "配送原因未完成", "复合准时率",
+        "承托比", "复合超时时长", "KA品牌客诉率", "品牌客诉率",
+    )
+    has_detail = any(term in compact for term in detail_terms)
+    has_metric = any(term in compact for term in metric_terms)
+    if has_detail and has_metric:
+        return True
+    if block.rows and has_detail and ("考核规则" in compact or "指标" in compact):
+        return True
+    if broken_example:
+        return False
+    return False
 
 
 def _ka_special_scene_fusion_blocks(ref: Block) -> List[Block]:
@@ -1970,6 +2060,9 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert "特殊场景算分示例" in text
         assert "融合后体验得分" in text
         assert "122.9818" in text
+        assert "距离≤3公里" in text
+        assert "距离>3公里" in text
+        assert "40天气免责" in text
 
     def case_special_scene_formula_one_minus_t() -> None:
         text = "体验指标得分=特殊场景体验得分*t＋普通场景体验得分*（1 t）具体方案详见：5.7"

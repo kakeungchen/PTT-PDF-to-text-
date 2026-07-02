@@ -470,6 +470,39 @@ class NormalizeBlockTests(unittest.TestCase):
         self.assertNotIn("级力", flat)
         self.assertNotIn("240天气", flat)
 
+    def test_ka_57_preserves_rule_detail_from_mixed_raw_block(self):
+        blocks = [
+            Block(kind="heading", text="5.7 特殊场景体验融合考核的说明", level=4),
+            Block(kind="image", flags=["table_fallback"], rows=[
+                ["方案", "内容"],
+                ["考核方式", "普通场景和特殊场景分两套目标考核，按剔除异常单后的特殊场景完成单占比计算融合后体验得分。"],
+                ["考核指标", "虚假点送达率、配送原因未完成率、复合准时率、KA 品牌负向反馈率、承托比、复合超时时长、KA 品牌客诉率。"],
+                ["天气等级", "10：正常天气；20：一般恶劣天气：30：比较恶劣天气：40：非常恶劣天气"],
+                ["考核规则", "以运单首次调度时的天气等级判定为依据，按下方规则分普通场景和特殊场景考核。"],
+                ["", "体验指标 普通场景考核 特殊场景考核 备注"],
+                ["", "KA品牌负向反馈率 距离≤3公里的正 距离>3公里的正常 /"],
+                ["", "配送原因未完成率 距离≤3公里的正 距离＞3公里的正常 40天气或240天气常天气单（天气等 天气单 免责级为 10） 恶劣天气单（天气等级 20或30）"],
+                ["", "复合超时时长 常天气单（天气等 天气单 免责或大于5公里级为 10） 恶劣天气单（天气等 远距离单"],
+                ["方案", "内容"],
+                ["考核目标", "不同场景的体验目标"],
+                ["", "站点组A麦当劳品 牌特殊场景算分示例"],
+                ["融合后体", "指标", "数值"],
+            ]),
+            Block(kind="heading", text="5.8 站点组KA品牌单体验得分计算公式", level=4),
+        ]
+
+        normalize_blocks(blocks)
+
+        flat = "\n".join(_test_block_text(b) for b in blocks)
+        self.assertIn("考核规则明细", flat)
+        self.assertIn("KA品牌负向反馈率", flat)
+        self.assertIn("配送原因未完成率", flat)
+        self.assertIn("复合超时时长", flat)
+        self.assertIn("距离≤3公里的正常天气单", flat)
+        self.assertIn("距离>3公里的正常天气单", flat)
+        self.assertIn("40天气免责", flat)
+        self.assertIn("大于5公里远距离单", flat)
+
     def test_flattened_ka_score_rule_table_is_repaired(self):
         blk = Block(kind="table", rows=[
             ["", "以复合准时率为例一计分规则："],

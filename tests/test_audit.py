@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from ptt.audit import scan_markdown, select_sample
+from ptt.coverage import _missing_numeric_anchors, _missing_seen_terms
 
 
 class AuditTests(unittest.TestCase):
@@ -147,6 +148,23 @@ class AuditTests(unittest.TestCase):
 
         issue_types = [issue["type"] for issue in result["issues"]]
         self.assertIn("表格结构可读性问题", issue_types)
+
+    def test_coverage_allows_normalized_weather_and_unit_noise(self):
+        self.assertEqual(
+            _missing_seen_terms(
+                "天气等级20恶劣天气单",
+                "天气等级为20或30或40恶劣天气单",
+                ["天气等级20", "恶劣天气单"],
+            ),
+            [],
+        )
+        self.assertEqual(
+            _missing_numeric_anchors(
+                "40天气或240天气免责，得分 120S",
+                "40天气免责，得分：120",
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":

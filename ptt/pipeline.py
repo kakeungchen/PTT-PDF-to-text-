@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+from copy import deepcopy
 from typing import Callable, List, Optional
 
 import fitz
@@ -98,6 +99,7 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
     vote_notes = qa.doc_vote_fix(result.blocks)
     if vote_notes:
         result.warnings.extend(vote_notes[:10])
+    result.meta["raw_blocks"] = deepcopy(result.blocks)
     norm_notes = normalize_blocks(result.blocks)
     if norm_notes:
         result.warnings.extend(norm_notes[:20])

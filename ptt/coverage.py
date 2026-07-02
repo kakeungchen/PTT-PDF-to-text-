@@ -79,10 +79,12 @@ def audit_pdf_markdown_coverage(pdf_path: str,
     section headings seen in the source evidence are required in the Markdown.
     """
     source_text = _source_text(pdf_path, result.blocks)
+    raw_blocks = result.meta.get("raw_blocks") or result.blocks
     issues: List[str] = []
     issues.extend(_check_markdown_readability(markdown_text))
     issues.extend(_check_table_block_rendering(result.blocks, markdown_text))
     issues.extend(_check_image_block_coverage(result.blocks, markdown_text))
+    issues.extend(_check_raw_block_coverage(raw_blocks, markdown_text))
     issues.extend(_check_ka_required_content(markdown_text))
     issues.extend(_check_section_coverage(source_text, markdown_text))
     issues.extend(_check_global_key_term_coverage(source_text, markdown_text))
@@ -136,6 +138,150 @@ def _blocks_text(blocks: List[Block]) -> str:
         if blk.rows:
             out.extend(" ".join(c for c in row if c) for row in blk.rows)
     return "\n".join(out)
+
+
+def _check_raw_block_coverage(raw_blocks: List[Block],
+                              markdown_text: str) -> List[str]:
+    issues: List[str] = []
+    if not raw_blocks:
+        return issues
+    issues.extend(_check_ka_57_raw_rule_coverage(raw_blocks, markdown_text))
+    issues.extend(_check_raw_high_risk_block_coverage(raw_blocks, markdown_text))
+    return issues
+
+
+def _check_ka_57_raw_rule_coverage(raw_blocks: List[Block],
+                                   markdown_text: str) -> List[str]:
+    section_blocks = _raw_section_blocks(raw_blocks, "5.7", "5.8")
+    if not section_blocks:
+        return []
+    raw_text = "\n".join(_block_text_for_coverage(b) for b in section_blocks)
+    raw_compact = _compact(raw_text)
+    if ("考核规则" not in raw_compact
+            and not ("普通场景考核" in raw_compact and "特殊场景考核" in raw_compact)):
+        return []
+    md_57 = _extract_markdown_section(markdown_text, "5.7") or markdown_text
+    md_compact = _compact(md_57)
+    required_if_seen = [
+        "普通场景", "特殊场景", "备注",
+        "KA品牌负向反馈率", "负向反馈率", "虚假点送达率", "虚假点送达",
+        "配送原因未完成率", "配送原因未完成", "复合准时率",
+        "承托比", "复合超时时长", "KA品牌客诉率", "品牌客诉率",
+        "距离≤3公里", "距离<3公里", "距离>3公里", "距离≥3公里",
+        "天气等级为10", "天气等级20", "天气等级为20", "天气等级为30",
+        "正常天气单", "恶劣天气单", "40天气免责", "240天气免责",
+        "HD尾单", "专送兜底",
+    ]
+    missing = _missing_seen_terms(raw_compact, md_compact, required_if_seen)
+    if missing:
+        return ["覆盖审计: 5.7 原始考核规则明细未进入 Markdown：" + "、".join(missing[:8])]
+    return []
+
+
+def _check_raw_high_risk_block_coverage(raw_blocks: List[Block],
+                                        markdown_text: str) -> List[str]:
+    md_compact = _compact(markdown_text)
+    issues: List[str] = []
+    for idx, block in enumerate(raw_blocks):
+        text = _block_text_for_coverage(block)
+        compact = _compact(text)
+        if not _is_high_risk_raw_block(block, compact):
+            continue
+        anchors = _raw_block_anchors(text)
+        missing = _missing_seen_terms(compact, md_compact, anchors)
+        if len(missing) >= 2:
+            issues.append(
+                f"覆盖审计: 原始区块{idx}重要内容疑似丢失 "
+                + "、".join(missing[:6])
+            )
+    return issues[:12]
+
+
+def _raw_section_blocks(blocks: List[Block], start_token: str,
+                        end_token: str) -> List[Block]:
+    start = None
+    for idx, block in enumerate(blocks):
+        compact = _compact(_block_text_for_coverage(block))
+        if start_token.replace(".", "") in compact.replace(".", ""):
+            start = idx
+            break
+    if start is None:
+        return []
+    end = len(blocks)
+    end_norm = end_token.replace(".", "")
+    for idx in range(start + 1, len(blocks)):
+        compact = _compact(_block_text_for_coverage(blocks[idx]))
+        if end_norm in compact.replace(".", ""):
+            end = idx
+            break
+    return blocks[start:end]
+
+
+def _block_text_for_coverage(block: Block) -> str:
+    parts: List[str] = []
+    if block.text:
+        parts.append(block.text)
+    if block.rows:
+        parts.extend(" ".join(c for c in row if c) for row in block.rows)
+    return "\n".join(parts)
+
+
+def _is_high_risk_raw_block(block: Block, compact: str) -> bool:
+    if not compact or len(compact) < 20:
+        return False
+    if block.kind == "heading":
+        return False
+    high_terms = (
+        "考核规则", "考核目标", "核算公式", "计算公式", "指标定义",
+        "数据来源", "普通场景算分示例", "特殊场景算分示例",
+        "融合后体验得分", "降星规则", "查询路径",
+    )
+    if any(term in compact for term in high_terms):
+        return True
+    if block.rows and any(term in compact for term in ("指标", "规则", "备注", "得分", "权重")):
+        return True
+    return False
+
+
+def _raw_block_anchors(text: str) -> List[str]:
+    anchors = [
+        "考核方式", "考核指标", "天气等级", "考核规则", "考核目标",
+        "考核目标举例", "普通场景体验满分目标", "特殊场景体验满分目标",
+        "核算公式", "普通场景算分示例", "特殊场景算分示例", "融合后体验得分",
+        "指标", "分子数值", "分母数值", "达标率", "满分目标", "权重", "得分",
+        "普通场景", "特殊场景", "备注", "数据来源", "查询路径",
+        "KA品牌负向反馈率", "虚假点送达率", "虚假点送达",
+        "配送原因未完成率", "复合准时率", "承托比", "复合超时时长",
+        "KA品牌客诉率", "40天气免责", "HD尾单", "专送兜底",
+    ]
+    return anchors + _missing_numeric_anchors(text, "")
+
+
+def _missing_seen_terms(source_compact: str, target_compact: str,
+                        terms: List[str]) -> List[str]:
+    out: List[str] = []
+    for term in terms:
+        compact = _compact(term)
+        if not compact or compact not in source_compact:
+            continue
+        variants = _coverage_variants(compact)
+        if not any(v in target_compact for v in variants):
+            out.append(term)
+    return _dedupe(out)
+
+
+def _coverage_variants(compact: str) -> List[str]:
+    variants = {compact}
+    if compact.endswith("率"):
+        variants.add(compact[:-1])
+    variants.add(compact.replace("≤", "<=").replace("≥", ">="))
+    variants.add(compact.replace("<=", "≤").replace(">=", "≥"))
+    variants.add(compact.replace("天气等级为", "天气等级"))
+    if compact.startswith("天气等级") and not compact.startswith("天气等级为"):
+        variants.add(compact.replace("天气等级", "天气等级为", 1))
+    variants.add(compact.replace("KA品牌", "KA"))
+    variants.add(compact.replace("240天气", "40天气或240天气"))
+    return [v for v in variants if v]
 
 
 def _compact(text: str) -> str:
@@ -467,9 +613,12 @@ def _extract_markdown_section(markdown_text: str, heading_token: str) -> str:
 def _missing_numeric_anchors(source: str, target: str) -> List[str]:
     target_compact = _compact(target).replace(",", "").replace("，", "")
     anchors: List[str] = []
-    for token in _NUMBER_RE.findall(source):
+    for match in _NUMBER_RE.finditer(source):
+        token = match.group(0)
         clean = _compact(token).replace(",", "")
         if not clean or clean in {"1", "2", "3", "4", "5", "6", "7", "8", "9"}:
+            continue
+        if clean.endswith("天") and source[match.end():match.end() + 1] == "气":
             continue
         # Plain integers are too noisy unless they are large enough to be an
         # example value, denominator, or score anchor.
@@ -482,6 +631,8 @@ def _missing_numeric_anchors(source: str, target: str) -> List[str]:
         variants = {token, token.replace("%", "％")}
         if token.endswith(".0"):
             variants.add(token[:-2])
+        if re.fullmatch(r"\d+(?:[.,]\d+)?[sS]", token):
+            variants.add(token[:-1])
         if not any(v in target_compact for v in variants):
             missing.append(token)
     return missing
@@ -642,6 +793,42 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         )
         assert _check_section_coverage(source, md) == []
 
+    def case_raw_ka_57_rule_detail_missing_fails() -> None:
+        raw_blocks = [
+            Block(kind="heading", text="5.7 特殊场景体验融合考核的说明", level=4),
+            Block(kind="table", rows=[
+                ["指标", "普通场景考核", "特殊场景考核", "备注"],
+                ["复合超时时长", "距离≤3公里正常天气单", "距离>3公里正常天气单；恶劣天气单", "40天气免责；HD尾单&专送兜底"],
+            ]),
+            Block(kind="heading", text="5.8 下一节", level=4),
+        ]
+        result = DocResult(blocks=[], meta={"raw_blocks": raw_blocks})
+        md = (
+            "#### 5.7 特殊场景体验融合考核的说明\n"
+            "**考核规则**\n"
+            "以运单首次调度时的天气等级判定为依据。\n"
+        )
+        issues = audit_pdf_markdown_coverage("", result, md)
+        assert any("5.7 原始考核规则明细" in issue for issue in issues)
+
+    def case_raw_ka_57_rule_detail_complete_passes() -> None:
+        raw_blocks = [
+            Block(kind="heading", text="5.7 特殊场景体验融合考核的说明", level=4),
+            Block(kind="table", rows=[
+                ["指标", "普通场景考核", "特殊场景考核", "备注"],
+                ["复合超时时长", "距离≤3公里正常天气单", "距离>3公里正常天气单；恶劣天气单", "40天气免责；HD尾单&专送兜底"],
+            ]),
+            Block(kind="heading", text="5.8 下一节", level=4),
+        ]
+        result = DocResult(blocks=[], meta={"raw_blocks": raw_blocks})
+        md = (
+            "#### 5.7 特殊场景体验融合考核的说明\n"
+            "| 指标 | 普通场景考核 | 特殊场景考核 | 备注 |\n"
+            "|---|---|---|---|\n"
+            "| 复合超时时长 | 距离≤3公里正常天气单 | 距离>3公里正常天气单；恶劣天气单 | 40天气免责；HD尾单&专送兜底 |\n"
+        )
+        assert audit_pdf_markdown_coverage("", result, md) == []
+
     def case_readability_fails_long_line() -> None:
         issues = _check_markdown_readability("长句" * 230)
         assert issues and "过长" in issues[0]
@@ -695,6 +882,8 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
         ("coverage.section_complete_passes", case_section_complete_passes),
         ("coverage.adjacent_522_fusion_score_does_not_fail_521", case_adjacent_522_fusion_score_does_not_fail_521),
+        ("coverage.raw_ka_57_rule_detail_missing_fails", case_raw_ka_57_rule_detail_missing_fails),
+        ("coverage.raw_ka_57_rule_detail_complete_passes", case_raw_ka_57_rule_detail_complete_passes),
         ("coverage.readability_fails_long_line", case_readability_fails_long_line),
         ("coverage.readability_fails_formula_glued_to_text", case_readability_fails_formula_glued_to_text),
         ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),
