@@ -10,6 +10,7 @@ import json
 import os
 import sys
 
+from . import __version__
 from .pipeline import convert
 
 
@@ -22,6 +23,7 @@ def main(argv=None):
     ap.add_argument("-f", "--formats", nargs="+", default=["md"],
                     choices=["md", "docx"], help="输出格式（默认只输出 Markdown）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出结果（Agent 模式）")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
 
     results = []

@@ -5,6 +5,7 @@ venv/
 # Python 运行产物
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # macOS
 .DS_Store
@@ -13,3 +14,6 @@ __pycache__/
 转换结果/
 转换结果示例/
 *.pdf
+
+# 发布产物（建议放在 GitHub Release，不放仓库根目录）
+*.zip

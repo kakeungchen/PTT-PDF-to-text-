@@ -51,6 +51,9 @@
 # 基本用法：只输出一个 Markdown 文件
 .venv/bin/python -m ptt.cli 文件.pdf -o 输出目录
 
+# 查看当前版本号
+.venv/bin/python -m ptt.cli --version
+
 # Agent 模式：结果 JSON 走 stdout，进度走 stderr
 .venv/bin/python -m ptt.cli 文件.pdf --json
 
@@ -81,3 +84,15 @@ PDF ──▶ 逐页判型（文本层 / 图片）
 - 极小的下标字符（如 K₁）处于 Vision 识别能力边缘——不确定的公式会标注需核对，并阻断“无问题通过”。
 - App 截图证据图内部的小字属于尽力识别：不确定区域会显式提示，而不是静默猜测。
 - 工具不确定的内容一律显式标注，绝不静默猜测。
+
+## 版本号与发版
+
+- 当前版本号统一写在 [ptt/__init__.py](ptt/__init__.py)。
+- 建议使用语义化版本：
+  - `0.1.1` 表示修 bug
+  - `0.2.0` 表示新增功能但兼容旧用法
+  - `1.0.0` 表示第一个稳定正式版
+- 每次发版都同步更新 [CHANGELOG.md](CHANGELOG.md)。
+- Git 标签建议使用 `v0.1.0` 这种格式，便于和 GitHub Release 对齐。
+
+具体上传到 GitHub 和发版的步骤见 [docs/release-process.md](docs/release-process.md)。

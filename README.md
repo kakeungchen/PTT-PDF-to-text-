@@ -51,6 +51,9 @@ It was battle-tested on the hardest kind of real-world input: ultra-long screens
 # Basic: one Markdown file
 .venv/bin/python -m ptt.cli file.pdf -o output_dir
 
+# Show the current version
+.venv/bin/python -m ptt.cli --version
+
 # Agent mode: JSON to stdout, progress to stderr
 .venv/bin/python -m ptt.cli file.pdf --json
 
@@ -81,3 +84,15 @@ No ML model downloads, no PyTorch — OCR is Apple's Vision framework, which shi
 - Tiny subscript glyphs (e.g. K₁) are at the edge of Vision's ability — uncertain formulas are marked for review and block a clean audit pass.
 - Text inside app-screenshot evidence images is best-effort: uncertain regions are explicitly flagged rather than silently guessed.
 - Anything the tool isn't sure about is flagged, never silently guessed.
+
+## Versioning and releases
+
+- The current app version lives in [ptt/__init__.py](ptt/__init__.py).
+- Follow semantic versioning:
+  - `0.1.1` for bug fixes
+  - `0.2.0` for backward-compatible features
+  - `1.0.0` for the first stable public release
+- Keep release notes in [CHANGELOG.md](CHANGELOG.md).
+- Use Git tags like `v0.1.0` so GitHub Releases and local history stay aligned.
+
+The step-by-step GitHub publishing flow is documented in [docs/release-process.md](docs/release-process.md).
