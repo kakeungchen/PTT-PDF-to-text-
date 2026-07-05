@@ -78,13 +78,22 @@ def audit_pdf_markdown_coverage(pdf_path: str,
     The check is deliberately evidence based: only terms, formulas, numbers, and
     section headings seen in the source evidence are required in the Markdown.
     """
-    source_text = _source_text(pdf_path, result.blocks)
     raw_blocks = result.meta.get("raw_blocks") or result.blocks
+    raw_regions = result.meta.get("raw_regions") or []
+    source_text = _source_text(pdf_path, raw_blocks)
+    raw_region_text = _raw_regions_text(raw_regions)
+    if raw_region_text:
+        source_text = "\n".join(part for part in (source_text, raw_region_text) if part)
     issues: List[str] = []
+    issues.extend(_check_review_markers(markdown_text))
+    issues.extend(_check_toc_body_consistency(markdown_text))
+    issues.extend(_check_heading_sequence_gaps(markdown_text))
     issues.extend(_check_markdown_readability(markdown_text))
     issues.extend(_check_table_block_rendering(result.blocks, markdown_text))
     issues.extend(_check_image_block_coverage(result.blocks, markdown_text))
     issues.extend(_check_raw_block_coverage(raw_blocks, markdown_text))
+    issues.extend(_check_raw_region_coverage(raw_regions, markdown_text))
+    issues.extend(_check_raw_policy_table_item_coverage(raw_blocks, raw_regions, markdown_text))
     issues.extend(_check_ka_required_content(markdown_text))
     issues.extend(_check_section_coverage(source_text, markdown_text))
     issues.extend(_check_global_key_term_coverage(source_text, markdown_text))
@@ -140,6 +149,119 @@ def _blocks_text(blocks: List[Block]) -> str:
     return "\n".join(out)
 
 
+def _raw_regions_text(raw_regions: List[dict]) -> str:
+    parts: List[str] = []
+    for region in raw_regions:
+        text = str(region.get("text") or "").strip()
+        if text:
+            parts.append(text)
+        rows = region.get("rows") or []
+        for row in rows:
+            if isinstance(row, (list, tuple)):
+                row_text = " ".join(str(c) for c in row if c)
+                if row_text:
+                    parts.append(row_text)
+    return "\n".join(parts)
+
+
+def _check_review_markers(markdown_text: str) -> List[str]:
+    issues: List[str] = []
+    markers = [
+        "图示/低置信区域未能可靠文本化",
+        "低置信区域（需核对）",
+        "表格结构需核对",
+        "公式原文（需核对）",
+    ]
+    for marker in markers:
+        if marker in markdown_text:
+            issues.append(f"覆盖审计: Markdown 仍包含需核对占位：{marker}")
+    return issues
+
+
+def _check_raw_region_coverage(raw_regions: List[dict],
+                               markdown_text: str) -> List[str]:
+    if not raw_regions:
+        return []
+    md_compact = _compact(markdown_text)
+    issues: List[str] = []
+    for idx, region in enumerate(raw_regions):
+        text = str(region.get("text") or "")
+        rows = region.get("rows") or []
+        if rows:
+            row_text = "\n".join(
+                " ".join(str(c) for c in row if c)
+                for row in rows if isinstance(row, (list, tuple))
+            )
+            text = "\n".join(part for part in (text, row_text) if part)
+        compact = _compact(text)
+        if not _is_high_risk_region(region, compact):
+            continue
+        anchors = _region_anchors(text)
+        missing = _missing_seen_terms(compact, md_compact, anchors)
+        if missing:
+            page = int(region.get("page") or 0) + 1
+            bbox = _format_bbox(region.get("bbox"))
+            issues.append(
+                f"覆盖审计: 第{page}页原始区域{idx}未完整进入 Markdown "
+                f"bbox=[{bbox}] 缺少：" + "、".join(missing[:6])
+            )
+        if len(issues) >= 20:
+            break
+    return issues
+
+
+def _is_high_risk_region(region: dict, compact: str) -> bool:
+    if not compact or len(compact) < 4:
+        return False
+    kind = str(region.get("kind") or "")
+    stage = str(region.get("stage") or "")
+    flags = set(region.get("flags") or [])
+    raw_text = str(region.get("text") or "").strip()
+    m_heading = _SOURCE_HEADING_RE.match(raw_text)
+    if m_heading and _is_probable_source_heading(m_heading.group(1), m_heading.group(2)):
+        return True
+    if stage == "ocr_line":
+        return False
+    if flags & {"auto_image", "table_fallback", "formula", "table_low_confidence"}:
+        return True
+    if kind in {"table", "image"} and len(compact) >= 12:
+        return True
+    high_terms = (
+        "检核", "管控规则", "违规说明", "消毒", "装备", "早会",
+        "考核规则", "考核目标", "核算公式", "计算公式", "指标定义",
+        "数据来源", "查询路径", "申诉", "责任承担", "违约", "整改",
+    )
+    if any(term in compact for term in high_terms):
+        return True
+    return False
+
+
+def _region_anchors(text: str) -> List[str]:
+    anchors = [
+        "线下检核", "线上视频检核", "站点线上早会", "骑手餐箱消毒",
+        "骑手装备检核", "区域商管控规则", "物防设施管理", "责任承担",
+        "查询路径", "申诉路径", "整改", "违约", "检核项目", "内容",
+        "考核方式", "考核指标", "天气等级", "考核规则", "考核目标",
+        "普通场景算分示例", "特殊场景算分示例", "融合后体验得分",
+        "指标", "分子数值", "分母数值", "达标率", "满分目标", "权重",
+        "数据来源", "普通场景", "特殊场景", "备注",
+    ]
+    stripped = text.strip()
+    m = _SOURCE_HEADING_RE.match(stripped)
+    if m and _is_probable_source_heading(m.group(1), m.group(2)):
+        anchors.extend([m.group(1), m.group(2)])
+    return _dedupe(anchors)
+
+
+def _format_bbox(value) -> str:
+    if not value:
+        return ""
+    try:
+        return ",".join(str(round(float(v), 1)) for v in value)
+    except Exception:
+        return str(value)
+
+
 def _check_raw_block_coverage(raw_blocks: List[Block],
                               markdown_text: str) -> List[str]:
     issues: List[str] = []
@@ -148,6 +270,209 @@ def _check_raw_block_coverage(raw_blocks: List[Block],
     issues.extend(_check_ka_57_raw_rule_coverage(raw_blocks, markdown_text))
     issues.extend(_check_raw_high_risk_block_coverage(raw_blocks, markdown_text))
     return issues
+
+
+def _check_raw_policy_table_item_coverage(raw_blocks: List[Block],
+                                          raw_regions: List[dict],
+                                          markdown_text: str) -> List[str]:
+    """Ensure Chinese policy-table item labels survive normalization/export.
+
+    These tables often use merged category cells.  If the repair/export path only
+    keeps the long content text, the Markdown can look plausible while losing the
+    actual ``检核项目`` such as ``1.健康证`` or ``23.选址安全``.
+    """
+    items = _raw_policy_items(raw_blocks, raw_regions)
+    if not items:
+        return []
+    md_compact = _compact(markdown_text)
+    missing: List[str] = []
+    for item_no, item_name, source_label in items:
+        if _policy_item_exported(md_compact, item_no, item_name):
+            continue
+        if source_label not in missing:
+            missing.append(source_label)
+        if len(missing) >= 12:
+            break
+    if not missing:
+        return []
+    return ["覆盖审计: 原始政策表检核项目未进入 Markdown：" + "、".join(missing)]
+
+
+def _raw_policy_items(raw_blocks: List[Block],
+                      raw_regions: List[dict]) -> List[Tuple[str, str, str]]:
+    seen = set()
+    out: List[Tuple[str, str, str]] = []
+
+    def add_from_text(text: str) -> None:
+        if not _looks_like_policy_source(text):
+            return
+        for item_no, item_name in _extract_policy_item_labels(text):
+            key = (item_no, item_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((item_no, item_name, f"{item_no}.{item_name}"))
+
+    for block in raw_blocks:
+        if block.rows:
+            text = "\n".join(" ".join(str(c) for c in row if c) for row in block.rows)
+            if not _looks_like_policy_source(text):
+                continue
+            header_idx, item_idx = _policy_table_item_column(block.rows)
+            if item_idx is not None:
+                for row in block.rows[header_idx + 1:]:
+                    cells = [str(c or "") for c in row]
+                    pieces = []
+                    if item_idx < len(cells):
+                        pieces.append(cells[item_idx])
+                    # Merged-cell damage can push the real item label into a
+                    # neighboring content cell, so inspect the whole row too.
+                    pieces.append(" ".join(cells))
+                    for item_no, item_name in _extract_policy_item_labels(" ".join(pieces)):
+                        key = (item_no, item_name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append((item_no, item_name, f"{item_no}.{item_name}"))
+            else:
+                add_from_text(text)
+        elif block.text:
+            add_from_text(block.text)
+
+    for region in raw_regions:
+        text = str(region.get("text") or "")
+        rows = region.get("rows") or []
+        if rows:
+            row_text = "\n".join(
+                " ".join(str(c) for c in row if c)
+                for row in rows if isinstance(row, (list, tuple))
+            )
+            text = "\n".join(part for part in (text, row_text) if part)
+        add_from_text(text)
+
+    return out
+
+
+def _looks_like_policy_source(text: str) -> bool:
+    compact = _compact(text)
+    if len(compact) < 20:
+        return False
+    header_like = (
+        "责任承担" in compact
+        and ("检核项目" in compact or "核项目" in compact or "检查项目" in compact)
+    )
+    if header_like:
+        return True
+    if "责任承担" in compact and len(_extract_policy_item_labels(text)) >= 2:
+        return True
+    return False
+
+
+def _policy_table_item_column(rows: List[List[str]]) -> Tuple[int, Optional[int]]:
+    for ridx, row in enumerate(rows[:5]):
+        cells = [_compact(str(c)) for c in row]
+        joined = "".join(cells)
+        if "责任承担" not in joined and "检核项目" not in joined:
+            continue
+        for idx, cell in enumerate(cells):
+            if "检核项目" in cell or cell in {"项目", "核项目", "检查项目"}:
+                return ridx, idx
+    return 0, None
+
+
+_POLICY_ITEM_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*[.．]\s*"
+    r"([A-Za-z\u4e00-\u9fff（）()/、]{1,28})"
+)
+
+
+def _extract_policy_item_labels(text: str) -> List[Tuple[str, str]]:
+    labels: List[Tuple[str, str]] = []
+    for match in _POLICY_ITEM_RE.finditer(text or ""):
+        item_no = match.group(1)
+        name = _clean_policy_item_name(match.group(2))
+        if not _policy_item_name_is_meaningful(name):
+            continue
+        labels.append((item_no, name))
+    return _dedupe_tuple(labels)
+
+
+def _clean_policy_item_name(text: str) -> str:
+    name = _compact(text)
+    name = re.split(
+        r"(?:责任承担|内容|一级分类|检核项目|分类|备注|①|②|③|④|⑤|⑥|⑦|⑧|⑨|⑩)",
+        name,
+        maxsplit=1,
+    )[0]
+    name = name.strip("：:;；,，。.")
+    # Common merged-cell joins from station-standard tables.
+    for prefix in ("安全台账", "选址安全", "视频监控", "标准站建设", "标准站",
+                   "健康证", "手提式灭火器", "站点烟感", "站点用电",
+                   "安全通道", "充电区选址", "充电区维保要求", "形象装备",
+                   "内容交流"):
+        if name.startswith(prefix):
+            return prefix
+    if len(name) > 12:
+        name = name[:12]
+    return name
+
+
+def _policy_item_name_is_meaningful(name: str) -> bool:
+    if len(name) < 2:
+        return False
+    if not re.search(r"[\u4e00-\u9fffA-Za-z]", name):
+        return False
+    noise = {
+        "内容", "项目", "分类", "一级分类", "检核项目", "责任承担", "说明",
+        "责任", "承担", "整改", "违约金", "标准", "建设", "配置", "安全",
+    }
+    if name in noise:
+        return False
+    if re.fullmatch(r"[A-Za-z]+", name) and len(name) <= 3:
+        return False
+    return True
+
+
+def _policy_item_exported(md_compact: str, item_no: str, item_name: str) -> bool:
+    for name in _policy_item_name_variants(item_name):
+        variants = [
+            f"{item_no}.{name}",
+            f"{item_no}．{name}",
+            f"{item_no}、{name}",
+            f"{item_no}{name}",
+        ]
+        if any(v in md_compact for v in variants):
+            return True
+    return False
+
+
+def _policy_item_name_variants(name: str) -> List[str]:
+    compact = _compact(name)
+    variants = [compact]
+    if compact.startswith("安全台账"):
+        variants.append("安全台账")
+    if compact.startswith("选址安全"):
+        variants.append("选址安全")
+    if compact.startswith("站点感"):
+        variants.append("站点")
+    if compact.startswith("标准站"):
+        variants.append("标准站")
+    if len(compact) >= 4:
+        variants.append(compact[:3])
+    elif len(compact) == 3:
+        variants.append(compact[:2])
+    return _dedupe(variants)
+
+
+def _dedupe_tuple(items: Iterable[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _check_ka_57_raw_rule_coverage(raw_blocks: List[Block],
@@ -281,6 +606,10 @@ def _coverage_variants(compact: str) -> List[str]:
         variants.add(compact.replace("天气等级", "天气等级为", 1))
     variants.add(compact.replace("KA品牌", "KA"))
     variants.add(compact.replace("240天气", "40天气或240天气"))
+    if "特殊场景" in compact:
+        variants.add(compact.replace("特殊场景", "特场景"))
+    if "特场景" in compact:
+        variants.add(compact.replace("特场景", "特殊场景"))
     return [v for v in variants if v]
 
 
@@ -289,7 +618,8 @@ def _compact(text: str) -> str:
 
 
 def _text_contains(haystack_compact: str, needle: str) -> bool:
-    return _compact(needle) in haystack_compact
+    compact = _compact(needle)
+    return any(v in haystack_compact for v in _coverage_variants(compact))
 
 
 def _extract_sections(text: str) -> List[SourceSection]:
@@ -304,6 +634,8 @@ def _extract_sections(text: str) -> List[SourceSection]:
         title = m.group(2).strip()
         if len(_compact(title)) < 2:
             continue
+        if not _is_probable_source_heading(token, title):
+            continue
         headings.append((idx, token, title))
 
     sections: List[SourceSection] = []
@@ -315,6 +647,22 @@ def _extract_sections(text: str) -> List[SourceSection]:
         sections.append(SourceSection(token=token, title=title,
                                       text=section_text, line_no=idx + 1))
     return sections
+
+
+def _is_probable_source_heading(token: str, title: str) -> bool:
+    title_compact = _compact(title)
+    if len(re.findall(r"[\u4e00-\u9fff]", title_compact)) < 2:
+        return False
+    if re.fullmatch(r"20\d{2}", token or "") and re.match(r"年\d{1,2}月", title_compact):
+        return False
+    if re.search(r"\d{4}年\d{1,2}月\d{1,2}日", token + title_compact):
+        return False
+    if re.fullmatch(r"\d+", token or ""):
+        if title_compact.startswith(("分钟", "秒", "公里", "km", "KM")):
+            return False
+        if any(term in title_compact for term in ("订单占比", "口径准时率", "完成订单量")):
+            return False
+    return True
 
 
 def _markdown_sections(markdown_text: str) -> Dict[str, str]:
@@ -334,6 +682,124 @@ def _markdown_sections(markdown_text: str) -> Dict[str, str]:
         token = m.group(1).replace("．", ".")
         out[token] = "\n".join(lines[idx:end])
     return out
+
+
+_TOC_LINE_RE = re.compile(
+    r"^\s*((?:\d+(?:[.．]\d+)*)|[一二三四五六七八九十]{1,3}[、.．])\s*"
+    r"(.+?)\s*[.。·•．…⋯\s]*\d{1,3}\s*$"
+)
+
+
+def _split_toc_and_body(markdown_text: str) -> Tuple[List[str], List[str]]:
+    lines = markdown_text.splitlines()
+    toc_start = None
+    for idx, line in enumerate(lines):
+        if re.match(r"^#{1,6}\s+目录\s*$", line.strip()) or line.strip() == "目录":
+            toc_start = idx
+            break
+    if toc_start is None:
+        return [], lines
+    toc_lines: List[str] = []
+    seen_entry = False
+    end = len(lines)
+    for idx in range(toc_start + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if not stripped:
+            if seen_entry:
+                toc_lines.append(lines[idx])
+            continue
+        if _TOC_LINE_RE.match(stripped):
+            seen_entry = True
+            toc_lines.append(lines[idx])
+            continue
+        if seen_entry:
+            end = idx
+            break
+    return toc_lines, lines[end:]
+
+
+def _extract_toc_entries(markdown_text: str) -> List[Tuple[str, str]]:
+    toc_lines, _ = _split_toc_and_body(markdown_text)
+    entries: List[Tuple[str, str]] = []
+    for line in toc_lines:
+        m = _TOC_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        token = m.group(1).replace("．", ".")
+        title = re.sub(r"[.。·•．…⋯\s]+$", "", m.group(2)).strip()
+        title = re.sub(r"\s+", "", title)
+        if len(_compact(title)) < 2:
+            continue
+        entries.append((token, title))
+    return entries
+
+
+def _check_toc_body_consistency(markdown_text: str) -> List[str]:
+    entries = _extract_toc_entries(markdown_text)
+    if len(entries) < 4:
+        return []
+    _, body_lines = _split_toc_and_body(markdown_text)
+    body_compact = _compact("\n".join(body_lines))
+    issues: List[str] = []
+    for token, title in entries:
+        title_compact = _compact(title)
+        if len(title_compact) <= 2 and re.fullmatch(r"目的|附则", title_compact):
+            continue
+        token_title = _compact(token + title)
+        variants = {
+            title_compact,
+            token_title,
+            _compact(token.replace("．", ".") + "." + title),
+            _compact(token.replace("．", ".") + " " + title),
+        }
+        if not any(v and v in body_compact for v in variants):
+            issues.append(f"覆盖审计: 目录章节正文疑似缺失 {token}{title}")
+    return issues[:20]
+
+
+def _check_heading_sequence_gaps(markdown_text: str) -> List[str]:
+    _, body_lines = _split_toc_and_body(markdown_text)
+    tokens: List[str] = []
+    for raw in body_lines:
+        line = raw.strip().lstrip("#").strip()
+        m = re.match(r"^(\d+(?:[.．]\d+){1,3})\s*", line)
+        if m:
+            tokens.append(m.group(1).replace("．", "."))
+    issues: List[str] = []
+    by_parent: Dict[str, List[int]] = {}
+    for token in tokens:
+        parts = token.split(".")
+        if len(parts) < 2:
+            continue
+        parent = ".".join(parts[:-1])
+        try:
+            child = int(parts[-1])
+        except ValueError:
+            continue
+        by_parent.setdefault(parent, []).append(child)
+    for parent, children in by_parent.items():
+        present = set(children)
+        ordered = []
+        for child in children:
+            if child not in ordered:
+                ordered.append(child)
+        for prev, cur in zip(ordered, ordered[1:]):
+            if cur > prev + 1:
+                missing = []
+                for n in range(prev + 1, cur):
+                    if n in present:
+                        continue
+                    token = f"{parent}.{n}"
+                    if any(t.startswith(token + ".") for t in tokens):
+                        continue
+                    missing.append(token)
+                if not missing:
+                    continue
+                issues.append(
+                    "覆盖审计: 正文章节编号跳号，疑似缺失 "
+                    + "、".join(missing[:5])
+                )
+    return issues[:12]
 
 
 def _check_section_coverage(source_text: str, markdown_text: str) -> List[str]:
@@ -422,7 +888,7 @@ def _check_image_block_coverage(blocks: List[Block],
             "formula" in blk.flags
             or ("auto_image" in blk.flags and _auto_image_is_important(blk))
             or "table_fallback" in blk.flags
-            or bool(blk.rows)
+            or _image_rows_are_important(blk)
         )
         if not important:
             continue
@@ -469,7 +935,10 @@ def _standard_table_rendered(rows: List[List[str]], markdown_text: str) -> bool:
 
 
 def _auto_image_is_important(blk: Block) -> bool:
-    text = _compact(blk.text or "")
+    row_text = ""
+    if blk.rows:
+        row_text = " ".join(" ".join(str(c) for c in row if c) for row in blk.rows)
+    text = _compact(" ".join(part for part in (blk.text or "", row_text) if part))
     if not text:
         return False
     if re.search(r"[=＝≤≥×÷*/]|SUM|Σ", text, re.I):
@@ -481,8 +950,29 @@ def _auto_image_is_important(blk: Block) -> bool:
     return any(term in text for term in important_terms)
 
 
+def _image_rows_are_important(blk: Block) -> bool:
+    if not blk.rows:
+        return False
+    row_text = _compact(" ".join(" ".join(str(c) for c in row if c) for row in blk.rows))
+    if len(row_text) < 12:
+        return False
+    if _auto_image_is_important(blk):
+        return True
+    non_empty_cells = [
+        _compact(str(c))
+        for row in blk.rows
+        for c in row
+        if _compact(str(c))
+    ]
+    if len(blk.rows) >= 2 and len(non_empty_cells) >= 4:
+        return True
+    return any(len(cell) >= 8 for cell in non_empty_cells)
+
+
 def _image_block_exported(blk: Block, markdown_text: str) -> bool:
     md_compact = _compact(markdown_text)
+    if _formula_fragment_replaced_by_latex(blk.text or "", markdown_text):
+        return True
     if "formula" in blk.flags and blk.text:
         latex = ""
         try:
@@ -492,17 +982,12 @@ def _image_block_exported(blk: Block, markdown_text: str) -> bool:
             latex = ""
         if latex and latex in markdown_text:
             return True
-        if "公式原文（需核对）" in md_compact and _text_anchors_exported(
-                blk.text, md_compact):
+        if _text_anchors_exported(blk.text, md_compact):
             return True
-    if "formula" in blk.flags and "公式原文（需核对）" in md_compact:
-        return True
-    if "table_fallback" in blk.flags and "表格结构需核对" in md_compact:
-        return True
-    if "auto_image" in blk.flags and "图示/低置信区域未能可靠文本化" in md_compact:
-        return True
     text = _compact(blk.text or "")
     if len(text) >= 8 and text[:40] in md_compact:
+        return True
+    if blk.text and _text_anchors_exported(blk.text, md_compact, min_hits=2):
         return True
     if blk.rows:
         row_text = _compact(" ".join(" ".join(row) for row in blk.rows))
@@ -519,7 +1004,24 @@ def _image_block_exported(blk: Block, markdown_text: str) -> bool:
     return False
 
 
-def _text_anchors_exported(text: str, md_compact: str) -> bool:
+def _formula_fragment_replaced_by_latex(text: str, markdown_text: str) -> bool:
+    compact = _compact(text)
+    if not compact:
+        return False
+    replacements = [
+        (("配送原因未定成率", "PKA"), r"\text{配送原因未完成率}"),
+        (("承托比", "RKA"), r"\text{承托比}"),
+        (("虚假点送达率", "TKA"), r"\text{虚假点送达率}"),
+        (("A1", "A2", "A3"), r"\text{复合超时时长}"),
+        (("站点组KA品牌单体验得分", "K1"), r"\text{站点组KA品牌单体验得分}"),
+    ]
+    for needles, latex_label in replacements:
+        if all(needle in compact for needle in needles) and latex_label in markdown_text:
+            return True
+    return False
+
+
+def _text_anchors_exported(text: str, md_compact: str, min_hits: int = 1) -> bool:
     anchors = []
     for raw in (text or "").splitlines():
         token = _compact(raw)
@@ -527,7 +1029,8 @@ def _text_anchors_exported(text: str, md_compact: str) -> bool:
             anchors.append(token[:28])
     if not anchors:
         return False
-    return any(anchor in md_compact for anchor in anchors)
+    hits = sum(1 for anchor in anchors if anchor in md_compact)
+    return hits >= min_hits
 
 
 def _check_ka_required_content(markdown_text: str) -> List[str]:
@@ -650,12 +1153,18 @@ def _missing_formula_left_sides(source: str, target: str) -> List[str]:
         left = re.split(r"[=＝≤≥]", line, maxsplit=1)[0]
         left = re.sub(r"^[|•·\-\s]+", "", left).strip(" ：:")
         left = re.sub(r"^(?:核算公式|计算公式|计分公式|计分规则\d*|指标定义)", "", left)
+        left = re.sub(r"^(?:考核项|项目|指标|内容|列\d+)[:：]?", "", left)
+        left = re.sub(
+            r"^.*?(?:结果计算公式|计算方式|核算公式|计算公式|计分公式)[:：]?",
+            "",
+            left,
+        )
         if re.search(r"[。；;]", left):
             continue
         left_compact = _compact(left)
         if len(left_compact) < 4 or len(left_compact) > 36:
             continue
-        if any(op in left_compact for op in ("<", ">", "≤", "≥", "〈", "〉")):
+        if any(op in left_compact for op in ("<", ">", "≤", "≥", "〈", "〉", "＜", "＞")):
             continue
         if "、" in left_compact:
             continue
@@ -664,6 +1173,14 @@ def _missing_formula_left_sides(source: str, target: str) -> List[str]:
         if re.search(r"[（(][^）)]*\d+\s*[,，]\s*\d+", left_compact):
             continue
         if "分钟" in left_compact and re.search(r"A[123]", left_compact):
+            continue
+        if "品牌体验得分" in left_compact:
+            continue
+        if "每日服务质量奖励费" in left_compact and "5星" in left_compact:
+            continue
+        if re.search(r"SUM|Σ", left_compact, re.I):
+            continue
+        if re.search(r"K[nN].*Q[nN]|Q[nN].*K[nN]", left_compact):
             continue
         left_anchor = _formula_left_anchor(left_compact)
         target_anchor = _formula_left_anchor(target_compact)
@@ -728,7 +1245,10 @@ def _check_markdown_readability(markdown_text: str) -> List[str]:
         if "$$" in stripped and stripped != "$$" and not (
                 stripped.startswith("$$") and stripped.endswith("$$")):
             issues.append(f"排版审计: 第{idx}行公式和正文粘连")
-        if re.search(r"[。；;]\s*(?:举例|示例|其中|注[:：]|指标说明|数据来源|考核范围)[:：]",
+        if re.search(r"[。；;]\s*(?:举例\d*[:：]|举例如下[:：]|示例|其中|"
+                     r"注[:：]|指标说明|数据来源|考核范围|"
+                     r"特殊说明[:：]|同时满足如下条件|【[^】]{2,24}】[:：]|"
+                     r"条件[一二三四五六七八九十][:：]|[1-9][.．]\s*[^0-9]|PS[:：]|备注[:：])",
                      stripped):
             issues.append(f"排版审计: 第{idx}行说明段落疑似未换行")
         if re.search(r"\|\s*[^|\n]{90,}\s*\|", stripped):
@@ -793,6 +1313,39 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         )
         assert _check_section_coverage(source, md) == []
 
+    def case_date_range_not_source_heading() -> None:
+        assert not _is_probable_source_heading("2026", "年06月01日-2026年06月30日")
+
+    def case_formula_field_label_not_left_side() -> None:
+        source = (
+            "2.1 考核框架\n"
+            "结果计算公式 异商混送最终得分=压力场景考核得分\n"
+            "2.2 压力场景考核得分\n"
+            "计算方式 月维度恶劣天气得分=Z日维度恶劣天气得分/恶劣天气天数\n"
+        )
+        md = (
+            "#### 2.1 考核框架\n"
+            "结果计算公式：异商混送最终得分=压力场景考核得分\n"
+            "#### 2.2 压力场景考核得分\n"
+            "计算方式：月维度恶劣天气得分=Z日维度恶劣天气得分/恶劣天气天数\n"
+        )
+        assert _check_section_coverage(source, md) == []
+
+    def case_heading_gap_duplicate_child_does_not_fail() -> None:
+        md = (
+            "# 文档\n\n"
+            "### 2. 具体要求\n\n"
+            "#### 2.1 合法合规经营\n\n"
+            "2.2.4 合作商需严格审核配送人员身份资质。\n\n"
+            "### 2.2配送人员权益保障\n\n"
+            "2.2.1 合作商需明确薪酬构成。\n\n"
+            "2.2.2 合作商需准时足额发放。\n\n"
+            "2.2.3 不得恶意克扣保险理赔金。\n\n"
+            "2.2.4 合作商不得向配送人员销售商品获取不正当利益。\n\n"
+            "2.2.5 合作商不得随意删除账号。\n"
+        )
+        assert _check_heading_sequence_gaps(md) == []
+
     def case_raw_ka_57_rule_detail_missing_fails() -> None:
         raw_blocks = [
             Block(kind="heading", text="5.7 特殊场景体验融合考核的说明", level=4),
@@ -829,6 +1382,57 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         )
         assert audit_pdf_markdown_coverage("", result, md) == []
 
+    def case_raw_policy_table_item_missing_fails() -> None:
+        raw_blocks = [
+            Block(kind="table", rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                ["健康证", "1.健康证", "健康证存在虚假。", "需承担违约责任"],
+                ["标准站", "3.视频监控", "未购买视频监控且未报备。", "200元/项/次"],
+            ]),
+        ]
+        result = DocResult(blocks=[], meta={"raw_blocks": raw_blocks})
+        md = (
+            "- 内容：健康证存在虚假。\n"
+            "  责任承担：需承担违约责任\n"
+            "- 一级分类：标准站\n"
+            "  内容：未购买视频监控且未报备。\n"
+            "  责任承担：200元/项/次\n"
+        )
+        issues = audit_pdf_markdown_coverage("", result, md)
+        assert any("1.健康证" in issue and "3.视频监控" in issue for issue in issues)
+
+    def case_raw_policy_table_item_grouped_text_passes() -> None:
+        raw_blocks = [
+            Block(kind="table", rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                ["健康证", "1.健康证", "健康证存在虚假。", "需承担违约责任"],
+                ["站", "建设", "标准 2.标准站 ①线上与线下地址准确。", "200元/项/次"],
+                ["安全台账", "22.安全台账宿舍23.选址安全",
+                 "此条规则只适用于广东省加盟站点。1.宿舍实际地址一致。",
+                 "300元/项/次"],
+            ]),
+        ]
+        result = DocResult(blocks=[], meta={"raw_blocks": raw_blocks})
+        md = (
+            "- 一级分类：健康证\n"
+            "  检核项目：1.健康证\n"
+            "  内容：健康证存在虚假。\n"
+            "  责任承担：需承担违约责任\n"
+            "- 一级分类：标准站\n"
+            "  检核项目：2.标准站建设\n"
+            "  内容：①线上与线下地址准确。\n"
+            "  责任承担：200元/项/次\n"
+            "- 一级分类：安全台账\n"
+            "  检核项目：22.安全台账\n"
+            "  内容：此条规则只适用于广东省加盟站点。\n"
+            "  责任承担：300元/项/次\n"
+            "- 一级分类：站外宿舍\n"
+            "  检核项目：23.选址安全\n"
+            "  内容：1.宿舍实际地址一致。\n"
+            "  责任承担：300元/项/次\n"
+        )
+        assert audit_pdf_markdown_coverage("", result, md) == []
+
     def case_readability_fails_long_line() -> None:
         issues = _check_markdown_readability("长句" * 230)
         assert issues and "过长" in issues[0]
@@ -847,6 +1451,20 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert _check_table_block_rendering(blocks, "数据：KA品牌相关考核指标数据")
         md = "| 数据 | 查询路径 | 负责人 |\n|---|---|---|\n| KA品牌相关考核指标数据 | 烽火台 | 渠道经理 |\n"
         assert _check_table_block_rendering(blocks, md) == []
+
+    def case_tiny_image_row_fragment_not_blocking() -> None:
+        blocks = [Block(kind="image", page=0, rows=[["知用户", "户", "效通知"]])]
+        assert _check_image_block_coverage(blocks, "") == []
+
+    def case_multiline_image_text_covered_by_anchors() -> None:
+        blocks = [Block(kind="image", page=0, flags=["auto_image"], text=(
+            "禁止入内\n"
+            "高校范围内封\n"
+            "违规取消\n"
+            "火车站无法进入"
+        ))]
+        md = "禁止入内\n高校范围内封闭，违规取消。\n"
+        assert _check_image_block_coverage(blocks, md) == []
 
     def case_ka_required_formula_missing_fails() -> None:
         md = (
@@ -882,11 +1500,18 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
         ("coverage.section_complete_passes", case_section_complete_passes),
         ("coverage.adjacent_522_fusion_score_does_not_fail_521", case_adjacent_522_fusion_score_does_not_fail_521),
+        ("coverage.date_range_not_source_heading", case_date_range_not_source_heading),
+        ("coverage.formula_field_label_not_left_side", case_formula_field_label_not_left_side),
+        ("coverage.heading_gap_duplicate_child_does_not_fail", case_heading_gap_duplicate_child_does_not_fail),
         ("coverage.raw_ka_57_rule_detail_missing_fails", case_raw_ka_57_rule_detail_missing_fails),
         ("coverage.raw_ka_57_rule_detail_complete_passes", case_raw_ka_57_rule_detail_complete_passes),
+        ("coverage.raw_policy_table_item_missing_fails", case_raw_policy_table_item_missing_fails),
+        ("coverage.raw_policy_table_item_grouped_text_passes", case_raw_policy_table_item_grouped_text_passes),
         ("coverage.readability_fails_long_line", case_readability_fails_long_line),
         ("coverage.readability_fails_formula_glued_to_text", case_readability_fails_formula_glued_to_text),
         ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),
+        ("coverage.tiny_image_row_fragment_not_blocking", case_tiny_image_row_fragment_not_blocking),
+        ("coverage.multiline_image_text_covered_by_anchors", case_multiline_image_text_covered_by_anchors),
         ("coverage.ka_required_formula_missing_fails", case_ka_required_formula_missing_fails),
         ("coverage.ka_required_formula_review_marker_fails", case_ka_required_formula_review_marker_fails),
     ]

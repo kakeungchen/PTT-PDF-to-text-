@@ -115,7 +115,12 @@ def image_fallback(blocks: List[Block], provider: StripProvider
     def flush_group():
         if not group:
             return
-        if _looks_like_multiline_text_formula("\n".join(b.text for b in group if b.text)):
+        group_text = "\n".join(b.text for b in group if b.text)
+        if _looks_like_table_continuation_fragment(group_text):
+            out.extend(group)
+            group.clear()
+            return
+        if _looks_like_multiline_text_formula(group_text):
             out.extend(group)
             group.clear()
             return
@@ -128,9 +133,10 @@ def image_fallback(blocks: List[Block], provider: StripProvider
         y1 = max(b.bbox[3] for b in group) + 8
         x0 = max(0, min(b.bbox[0] for b in group) - 60)
         x1 = min(provider.width, max(b.bbox[2] for b in group) + 60)
-        text = "\n".join(b.text for b in group if b.text)
+        text = group_text
         flags = ["auto_image"]
-        if any(_MATH_RE.search(b.text or "") for b in group):
+        if (any(_MATH_RE.search(b.text or "") for b in group)
+                and not _looks_like_table_continuation_fragment(text)):
             flags.append("formula")
         blk = Block(kind="image", page=group[0].page, text=text,
                     bbox=(x0, max(0, y0), x1, min(provider.height, y1)),
@@ -256,6 +262,37 @@ def _looks_like_multiline_text_formula(text: str) -> bool:
     return bool(re.search(r"[+＋]", compact))
 
 
+def _looks_like_table_continuation_fragment(text: str) -> bool:
+    """Detect table body fragments that contain formula-like symbols.
+
+    Long policy/rule tables often contain definitions such as ``占比=...``.
+    When a dense row is low-confidence, treating it as a visual formula creates
+    a misleading review marker and can hide the table text.  These fragments
+    usually mention repeated table entities and do not look like one centered
+    standalone fraction.
+    """
+    raw = text or ""
+    compact = re.sub(r"\s+", "", raw)
+    if len(compact) < 60:
+        return False
+    visual_formula_terms = (
+        "复合准时率", "配送原因未完成率", "承托比", "虚假点送达率",
+        "复合超时时长", "站点组体验总得分", "特殊场景完成单占比",
+        "客诉虚假点送达率",
+    )
+    if any(term in compact for term in visual_formula_terms):
+        return False
+    table_terms = (
+        "站点", "骑手", "排班", "时段", "出勤", "合格", "考核",
+        "班次", "烽火台", "目标值", "数据查询", "数据来源",
+    )
+    term_hits = sum(1 for term in table_terms if term in compact)
+    bracket_hits = compact.count("【") + compact.count("】")
+    column_gap_hits = len(re.findall(r"[^\n]{2,}\s{2,}[^\n]{2,}", raw))
+    label_hits = len(re.findall(r"(?:数|率|值|占比|时段|骑手|站点)[】）)]?", compact))
+    return term_hits >= 4 and (bracket_hits >= 3 or column_gap_hits >= 2 or label_hits >= 8)
+
+
 def _is_safe_low_confidence_formula(text: str) -> bool:
     s = re.sub(r'\s+', '', text or "")
     if not s:
@@ -288,6 +325,8 @@ def doc_vote_fix(blocks: List[Block]) -> List[str]:
     from collections import Counter
 
     def texts_of(b: Block):
+        if _is_protected_native_pdf_table(b):
+            return
         if b.kind in ("para", "heading"):
             yield b.text, ("text", None)
         else:
@@ -338,6 +377,8 @@ def doc_vote_fix(blocks: List[Block]) -> List[str]:
         return "".join(out)
 
     for b in blocks:
+        if _is_protected_native_pdf_table(b):
+            continue
         if b.kind in ("para", "heading"):
             b.text = fix(b.text)
         else:
@@ -346,6 +387,22 @@ def doc_vote_fix(blocks: List[Block]) -> List[str]:
             if b.kind == "image" and b.text:
                 b.text = fix(b.text)
     return notes
+
+
+def _is_protected_native_pdf_table(blk: Block) -> bool:
+    if "native_pdf_table" not in (blk.flags or []) or not blk.rows:
+        return False
+    joined = " ".join(" ".join(c for c in row if c) for row in blk.rows)
+    if not joined.strip():
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", joined))
+    if cjk > max(8, len(joined) * 0.08):
+        return False
+    terms = (
+        "Model", "Overall", "Edit", "Metric", "Pages", "TPS",
+        "DS-OCR", "Unlimited-OCR", "DeepSeek", "OCRVerse", "Nanonets",
+    )
+    return any(term in joined for term in terms)
 
 
 def qa_scan(blocks: List[Block]) -> Tuple[List[str], int]:
@@ -370,10 +427,11 @@ def qa_scan(blocks: List[Block]) -> Tuple[List[str], int]:
             n_flag += 1
             issues.append(f"块{i} 低置信度({blk.confidence:.2f}): "
                           f"{(blk.text or '')[:40]}")
-        if "table_low_confidence" in blk.flags:
+        if "table_low_confidence" in blk.flags and not _is_protected_native_pdf_table(blk):
             n_flag += 1
             issues.append(f"块{i} 表格疑似列错位，建议人工复核")
-        elif blk.kind == "table" and blk.rows:
+        elif (blk.kind == "table" and blk.rows
+              and not _is_protected_native_pdf_table(blk)):
             score = table_suspect_score(blk.rows)
             if score >= 3:
                 if "table_low_confidence" not in blk.flags:

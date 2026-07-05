@@ -17,6 +17,44 @@ from .vision_ocr import (EmbeddedImageProvider, RenderProvider, StripProvider,
 ProgressFn = Callable[[str, float], None]  # (消息, 0~1)
 
 
+def _append_raw_block_regions(result: DocResult, blocks: List[Block],
+                              stage: str) -> None:
+    regions = result.meta.setdefault("raw_regions", [])
+    for idx, blk in enumerate(blocks):
+        parts = []
+        if blk.text:
+            parts.append(blk.text)
+        if blk.rows:
+            parts.extend(" ".join(c for c in row if c) for row in blk.rows)
+        regions.append({
+            "stage": stage,
+            "index": idx,
+            "kind": blk.kind,
+            "text": "\n".join(parts),
+            "rows": deepcopy(blk.rows) if blk.rows else None,
+            "bbox": tuple(blk.bbox),
+            "page": blk.page,
+            "confidence": blk.confidence,
+            "flags": list(blk.flags),
+        })
+
+
+def _append_raw_line_regions(result: DocResult, lines, page: int) -> None:
+    regions = result.meta.setdefault("raw_regions", [])
+    for idx, line in enumerate(lines):
+        regions.append({
+            "stage": "ocr_line",
+            "index": idx,
+            "kind": "line",
+            "text": line.text,
+            "rows": None,
+            "bbox": (line.x0, line.y0, line.x1, line.y1),
+            "page": page,
+            "confidence": line.conf,
+            "flags": [],
+        })
+
+
 def _page_provider(doc: fitz.Document, pno: int) -> StripProvider:
     """图片页取图：整页单图则原图解码（保真且兼容超长JPEG），否则渲染。"""
     page = doc[pno]
@@ -61,7 +99,11 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
         if text_chars >= 50:
             report(f"第 {pno+1}/{n} 页：文本提取", base)
             blocks, notes = text_extract.extract_text_page(
-                doc, pno, repeated, assets_dir, safe)
+                doc, pno, repeated, assets_dir, safe,
+                preserve_images=("docx" in formats),
+                detect_formula_images=("md" in formats))
+            result.meta.setdefault("raw_blocks", []).extend(deepcopy(blocks))
+            _append_raw_block_regions(result, blocks, "text_extract")
             result.blocks.extend(blocks)
             result.warnings.extend(notes)
         else:
@@ -71,11 +113,14 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
                 provider,
                 progress=lambda i, m: report(
                     f"第 {pno+1}/{n} 页：OCR {i}/{m} 片", base + (i / m) * 0.7 / n))
+            _append_raw_line_regions(result, lines, pno)
             blocks, notes = assemble.assemble_blocks(provider, lines, page=pno)
             result.warnings.extend(notes)
+            _append_raw_block_regions(result, blocks, "assembled_pre_recheck")
             report(f"第 {pno+1}/{n} 页：复核低置信内容", base + 0.75 / n)
             notes2 = qa.recheck_ocr_blocks(blocks, provider)
             result.warnings.extend(notes2)
+            raw_page_blocks = deepcopy(blocks)
             blocks, notes3 = qa.image_fallback(blocks, provider)
             result.warnings.extend(notes3)
             # 图片区域落盘
@@ -94,12 +139,14 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
                     img.save(path)
                     blk.image_path = path
             result.blocks.extend(blocks)
+            result.meta.setdefault("raw_blocks", []).extend(raw_page_blocks)
 
     # 全文词频投票纠错（形近字：封项值→封顶值、惺星→1星 等）
     vote_notes = qa.doc_vote_fix(result.blocks)
     if vote_notes:
         result.warnings.extend(vote_notes[:10])
-    result.meta["raw_blocks"] = deepcopy(result.blocks)
+    if "raw_blocks" not in result.meta:
+        result.meta["raw_blocks"] = deepcopy(result.blocks)
     norm_notes = normalize_blocks(result.blocks)
     if norm_notes:
         result.warnings.extend(norm_notes[:20])
@@ -151,10 +198,29 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
         pdf_path, result, md_text)
     if coverage_issues:
         issues.extend(coverage_issues)
-    blocking_issues = [
-        issue for issue in issues
-        if "表格疑似列错位" not in issue
-    ]
+    if md_paths:
+        try:
+            from .audit import scan_markdown
+            md_audit = scan_markdown(md_paths[0])
+            for issue in md_audit.get("issues", []):
+                issue_type = issue.get("type", "Markdown审计")
+                for match in issue.get("matches", [])[:5]:
+                    line = match.get("line", "?")
+                    text = match.get("text", "")
+                    issues.append(f"Markdown审计: {issue_type} 第{line}行 {text}")
+        except Exception as exc:
+            issues.append(f"Markdown审计无法完成: {exc}")
+    issues.extend(_blocking_issues_from_warnings(result.warnings, has_markdown=bool(md_paths)))
+    blocking_issues: List[str] = []
+    qa_warnings: List[str] = []
+    for issue in issues:
+        if "表格疑似列错位" in issue:
+            qa_warnings.append(
+                issue.replace("建议人工复核", "已进入覆盖审计复核")
+            )
+            blocking_issues.append(f"表格结构需复核: {issue}")
+            continue
+        blocking_issues.append(issue)
 
     # Markdown 只输出单文件；裁切图仅作 OCR/复核中间产物。
     # docx 图片在保存时已内嵌，也可以安全清理。
@@ -169,8 +235,23 @@ def convert(pdf_path: str, out_dir: str, formats=("md",),
         "pages": n,
         "blocks": len(result.blocks),
         "warnings": result.warnings,
-        "qa_issues": issues,
+        "qa_issues": blocking_issues,
+        "qa_warnings": qa_warnings,
         "blocking_qa": blocking_issues,
         "quality_ok": not blocking_issues,
         "flagged_blocks": n_flag,
     }
+
+
+def _blocking_issues_from_warnings(warnings: List[str],
+                                   has_markdown: bool = True) -> List[str]:
+    issues: List[str] = []
+    if not has_markdown:
+        return issues
+    for warning in warnings:
+        if "低置信区域已转为截图" in warning:
+            issues.append(
+                "单文件Markdown存在未输出的低置信截图区域: "
+                + warning
+            )
+    return issues

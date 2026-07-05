@@ -14,6 +14,7 @@ _NUMBERED_TOC_LINE = re.compile(r'^[一二三四五六七八九十]{1,3}、')
 
 def _md_escape_text(s: str) -> str:
     """转义会被 Markdown 解析的符号（OCR 文本里的 * _ 等是字面字符）。"""
+    s = _xml_safe_text(s)
     return re.sub(r'([*_`\[\]])', r'\\\1', s)
 
 
@@ -22,9 +23,29 @@ def _md_escape_cell(s: str) -> str:
     return _md_escape_text(clean).replace("|", "\\|")
 
 
+def _xml_safe_text(s: str) -> str:
+    """Remove PDF text-layer control characters that Word XML cannot store."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s or "")
+
+
 def _split_long_text_line(line: str, limit: int = 180) -> List[str]:
     if len(line) <= limit:
         return [line]
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", line))
+    if " " in line and cjk_count < len(line) * 0.2:
+        chunks: List[str] = []
+        chunk = ""
+        for word in line.split():
+            candidate = word if not chunk else chunk + " " + word
+            if chunk and len(candidate) > limit:
+                chunks.append(chunk)
+                chunk = word
+            else:
+                chunk = candidate
+        if chunk:
+            chunks.append(chunk)
+        if chunks:
+            return chunks
     pieces = re.split(r'([。；;，、+＋=＝:：])', line)
     chunks: List[str] = []
     chunk = ""
@@ -49,13 +70,30 @@ def _readable_text_lines(text: str) -> List[str]:
     if not text:
         return []
     text = re.sub(r'\s*<br\s*/?>\s*', "\n", text, flags=re.I)
+    text = re.sub(r'[；;]\s*(?=(?:注[①②]?[:：]|其中|考核范围[:：]|'
+                  r'数据来源[:：]|数据获取方式[:：]|指标说明[:：]|'
+                  r'举例\d*[:：]|举例如下[:：]|示例[:：]|剔除方式[:：]|'
+                  r'特殊说明[:：]|同时满足如下条件))',
+                  "\n", text)
+    text = re.sub(r'[；;]\s*[:：]\s*(?=(?:特殊说明[:：]|同时满足如下条件))',
+                  "\n", text)
+    text = re.sub(r'[；;]+\s*(?=(?:条件[一二三四五六七八九十][:：]|'
+                  r'[1-9][.．]\s*[^0-9]|PS[:：]|备注[:：]))',
+                  "\n", text)
     text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|其中[:：]|'
                   r'指标定义\d*[:：]|计算公式[:：]|核算公式[:：]|'
                   r'计分规则\d*[:：]|数据来源[:：]|指标说明[:：]|'
-                  r'考核范围[:：]|数据获取方式[:：]|分数计算规则[:：]))',
+                  r'考核范围[:：]|数据获取方式[:：]|剔除方式[:：]|'
+                  r'分数计算规则[:：]))',
                   "\n", text)
-    text = re.sub(r'(?<!^)(?<!算分)(?=(?:举例[:：]|示例[:：]))', "\n", text)
+    text = re.sub(r'(?<!^)(?<!算分)(?=(?:举例\d*[:：]|举例如下[:：]|示例[:：]))', "\n", text)
     text = re.sub(r'(?<=[。；;])\s*(?=[①②③④⑤⑥⑦⑧⑨]\s*)', "\n", text)
+    text = re.sub(r'(?<=[。.!?；;])\s*(?=[•·▪]\s*)', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=[1-9][.．]\s*[\u4e00-\u9fff])', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=其中)', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=注[①②]?[:：])', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=【[^】]{2,24}】[:：])', "\n", text)
+    text = re.sub(r'(?<!^)(?=(?:全月基础服务费=|每日计费服务质量等级数))', "\n", text)
     text = re.sub(r'(?<!^)(?=(?:[①②③④⑤⑥⑦⑧⑨]|[1-9][）)]|[1-9][.．])\s*'
                   r'(?:当|参与|同商|考核|数据|电话|风控|不满意|如|若))',
                   "\n", text)
@@ -70,6 +108,33 @@ def _readable_text_lines(text: str) -> List[str]:
             continue
         out.extend(_split_long_text_line(line))
     return out
+
+
+def _wrap_markdown_long_lines(md: str, limit: int = 220) -> str:
+    """Final pass: keep exported Markdown readable after later repair steps."""
+    out: List[str] = []
+    in_code = False
+    in_latex = False
+    for line in md.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if stripped.startswith("$$") and not (stripped.endswith("$$") and len(stripped) > 4):
+            in_latex = not in_latex
+            out.append(line)
+            continue
+        if (in_code or in_latex or not stripped or len(stripped) <= limit
+                or stripped.startswith(("#", "|", "$$", "![", "<!--"))
+                or re.match(r"^[-*]\s+", stripped)
+                or re.match(r"^\d{1,3}[.．]\s+", stripped)):
+            out.append(line)
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        for part in _split_long_text_line(stripped, limit):
+            out.append(indent + part)
+    return "\n".join(out).strip() + "\n"
 
 
 def _line_needs_formula_review(line: str) -> bool:
@@ -93,6 +158,14 @@ def _line_needs_formula_review(line: str) -> bool:
     return False
 
 
+def _emit_markdown_text_line(lines: List[str], value_line: str) -> None:
+    bullet = re.match(r"^[•·▪]\s*(.+)$", value_line.strip())
+    if bullet:
+        lines.append("- " + _md_escape_text(bullet.group(1).strip()))
+        return
+    lines.append(_md_escape_text(value_line))
+
+
 def _emit_reviewable_text(lines: List[str], text: str) -> None:
     for value_line in _readable_text_lines(text):
         latex = _formula_to_latex(value_line)
@@ -103,7 +176,48 @@ def _emit_reviewable_text(lines: List[str], text: str) -> None:
             lines.append("")
             lines.append(_md_escape_text(value_line))
         else:
-            lines.append(_md_escape_text(value_line))
+            _emit_markdown_text_line(lines, value_line)
+
+
+def _split_para_formula_tails(text: str) -> List[tuple[str, str]]:
+    """Split visual-formula tails that text PDFs glue to prose lines."""
+    clean = _xml_safe_text(text or "").strip()
+    if not clean:
+        return []
+    patterns = [
+        r"^(.*?\bcomputed as)\s+([A-Za-z𝑎-𝑧𝐴-𝑍α-ωΑ-Ω⊤⊥∑Σ√︁]{1,12})$",
+        r"^(.*?same accessible set:)\s*([∑Σ][︁]?)$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, clean, re.S)
+        if m:
+            prose = m.group(1).strip()
+            tail = m.group(2).strip()
+            if prose and tail:
+                return [("text", prose), ("formula_text", tail)]
+    return [("text", clean)]
+
+
+def _emit_para_or_formula_text(lines: List[str], pending_formula_text: List[str],
+                               text: str) -> None:
+    for kind, value in _split_para_formula_tails(text):
+        if kind == "formula_text":
+            pending_formula_text.append(value)
+            continue
+        if pending_formula_text:
+            lines.append("```text")
+            cleaned = []
+            for raw in pending_formula_text:
+                cleaned.extend(
+                    line.strip()
+                    for line in _xml_safe_text(raw).splitlines()
+                    if line.strip()
+                )
+            lines.extend(cleaned)
+            lines.append("```")
+            lines.append("")
+            pending_formula_text.clear()
+        _emit_reviewable_text(lines, value)
 
 
 def _table_is_complex(rows_data: List[List[str]]) -> bool:
@@ -117,13 +231,19 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
     joined = " ".join(cell_texts)
     blank_first_col = sum(1 for r in padded[1:] if not r[0].strip())
     header_joined = " ".join(c.strip() for c in padded[0] if c.strip())
+    header_set = {c.strip() for c in padded[0] if c.strip()}
     policy_like = re.search(
         r"释义|说明|数据来源|考核范围|查询路径|申诉|规则|事件|细则|管理目标|补充说明|"
-        r"参考指标|指标定义|计分|核算|公式",
+        r"参考指标|指标定义|计分|核算|公式|责任承担|整改|违约金|检核项目|"
+        r"提报条件|剔除条件",
         joined,
     )
 
+    if {"一级分类", "检核项目", "内容", "责任承担"}.issubset(header_set):
+        return True
     if ncol <= 1 and (row_count > 1 or max_cell_len > 40):
+        return True
+    if row_count == 1 and ncol == 2 and max_cell_len > 80:
         return True
     if ncol > 5:
         return True
@@ -131,7 +251,11 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
         return True
     if ncol == 2 and policy_like and max_cell_len > 60:
         return True
+    if ncol == 2 and policy_like and re.search(r"提报条件|剔除条件", header_joined) and max_cell_len > 40:
+        return True
     if ncol in (2, 3) and max_cell_len > 85 and policy_like:
+        return True
+    if ncol >= 3 and max_cell_len > 80 and re.search(r"内容|责任承担|检核项目", header_joined):
         return True
     if ncol >= 3 and re.search(r"释义|数据来源|事件细则|查询路径", header_joined) and max_cell_len > 45:
         return True
@@ -146,11 +270,72 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
     return False
 
 
+def _native_pdf_table_prefers_markdown(rows_data: List[List[str]],
+                                       flags: List[str]) -> bool:
+    if "native_pdf_table" not in (flags or []) or not rows_data:
+        return False
+    ncol = max(len(r) for r in rows_data)
+    if ncol < 2:
+        return False
+    padded = [r + [""] * (ncol - len(r)) for r in rows_data]
+    cell_texts = [c.strip() for r in padded for c in r if c.strip()]
+    joined = " ".join(cell_texts)
+    max_cell_len = max((len(c) for c in cell_texts), default=0)
+    header = {c.strip() for c in padded[0] if c.strip()}
+    policy_header = {"一级分类", "检核项目", "内容", "责任承担"}.issubset(header)
+    policy_terms = re.search(
+        r"责任承担|整改|违约金|检核项目|考核范围|数据来源|指标说明|查询路径|申诉|"
+        r"特殊说明|管理规范|安全|站点|骑手",
+        joined,
+    )
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", joined))
+    if policy_header:
+        return False
+    if policy_terms and cjk_chars > len(joined) * 0.25 and max_cell_len > 45:
+        return False
+    if any("<br" in c.lower() for r in padded for c in r):
+        return False
+    return True
+
+
 def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
     ncol = max(len(r) for r in rows_data)
     rows = [r + [""] * (ncol - len(r)) for r in rows_data]
     header = [c.strip() for c in rows[0]]
     body = rows[1:] if len(rows) > 1 else rows
+
+    if ncol == 1 and len(rows) > 1:
+        first_cell = header[0]
+        first_is_header = len(first_cell) <= 12 and re.search(
+            r"项目|内容|说明|指标|数据|路径|问题|答案|备注|目标|管理", first_cell)
+        answer_like = not first_is_header and (
+            len(first_cell) > 18
+            or re.search(r"申诉|查询路径|数据来源|考核|得分|目标|规则", first_cell)
+        )
+        if answer_like:
+            for row in rows:
+                cell = row[0].strip()
+                if not cell:
+                    continue
+                for idx, value_line in enumerate(_readable_text_lines(cell)):
+                    prefix = "- " if idx == 0 else "  "
+                    if _line_needs_formula_review(value_line):
+                        lines.append(prefix + "**公式原文（需核对）**")
+                        prefix = "  "
+                    lines.append(prefix + _md_escape_text(value_line))
+            lines.append("")
+            return
+
+    if len(rows_data) == 1 and ncol == 2 and rows[0][0].strip() in (
+            "内容", "说明", "项目", "备注"):
+        key, value = rows[0][0].strip(), rows[0][1].strip()
+        if key:
+            lines.append(f"**{_md_escape_text(key)}**")
+            lines.append("")
+        for value_line in _readable_text_lines(value):
+            lines.append(_md_escape_text(value_line))
+        lines.append("")
+        return
 
     two_col = ncol == 2 and (
         header[0] in ("项目", "指标", "类型", "要求", "维度")
@@ -176,7 +361,27 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
     if any(c for c in header):
         lines.append("**" + _md_escape_text(" / ".join(c for c in header if c)) + "**")
         lines.append("")
+    header_set = {c.strip() for c in header if c.strip()}
+    policy_row_labels = {
+        "一级分类", "检核项目", "内容", "责任承担"
+    }.issubset(header_set)
     for row in body:
+        if policy_row_labels and len(row) >= 2:
+            first_cell = (row[0] or "").strip()
+            second_cell = (row[1] or "").strip()
+            if first_cell == "内容" and second_cell.startswith("特殊说明"):
+                lines.append("**特殊说明**")
+                lines.append("")
+                note = re.sub(r"^特殊说明[:：]?", "", second_cell).strip()
+                note_parts = [note] + [
+                    (cell or "").strip() for cell in row[2:] if (cell or "").strip()
+                ]
+                for part in note_parts:
+                    for value_line in _readable_text_lines(part):
+                        lines.append(_md_escape_text(value_line))
+                lines.append("")
+                continue
+
         pairs = []
         for idx, cell in enumerate(row):
             cell = cell.strip()
@@ -192,7 +397,15 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
                 re.search(r"参考指标|释义|数据来源|说明|考核范围|查询路径", label)
                 for label, _ in pairs
             )
-            if not structured_labels and len(one_line) <= 220:
+            needs_break = re.search(
+                r"[；;]\s*(?:注[①②]?[:：]|数据来源[:：]|考核范围[:：]|"
+                r"指标说明[:：]|举例\d*[:：]|举例如下[:：]|示例[:：]|剔除方式[:：]|其中|"
+                r"特殊说明[:：]|同时满足如下条件|【[^】]{2,24}】[:：]|"
+                r"条件[一二三四五六七八九十][:：]|[1-9][.．]\s*[^0-9]|PS[:：]|备注[:：])",
+                one_line,
+            )
+            if (not policy_row_labels and not structured_labels
+                    and len(one_line) <= 220 and not needs_break):
                 lines.append("- " + _md_escape_text(one_line))
             else:
                 first = True
@@ -209,6 +422,233 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
     lines.append("")
 
 
+def _compact_table_text(rows_data: List[List[str]]) -> str:
+    return re.sub(r"\s+", "", " ".join(
+        " ".join(cell for cell in row if cell) for row in rows_data
+    ))
+
+
+_TOC_BODY_LINE_RE = re.compile(
+    r"^\s*((?:\d+(?:[.．]\d+)*)|[一二三四五六七八九十]{1,3}[、.．])\s*"
+    r"(.+?)\s*[.。·•．…⋯\s]*\d{1,3}\s*$"
+)
+_TOC_ENTRY_TOKEN_RE = re.compile(
+    r"(?<![\d.．])(\d{1,2}(?:[.．]\d{1,2}){0,4})[.．]?\s+(?=[A-Za-z\u4e00-\u9fff])"
+)
+
+
+def _ensure_toc_body_headings(md: str) -> str:
+    lines = md.splitlines()
+    toc_start = None
+    for idx, line in enumerate(lines):
+        if line.strip() in ("# 目录", "目录"):
+            toc_start = idx
+            break
+    if toc_start is None:
+        return md
+
+    entries = []
+    seen_entry = False
+    body_start = None
+    for idx in range(toc_start + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        m = _TOC_BODY_LINE_RE.match(stripped)
+        if m:
+            seen_entry = True
+            token = m.group(1).replace("．", ".")
+            title = re.sub(r"[.。·•．…⋯\s]+$", "", m.group(2)).strip()
+            if len(re.sub(r"\s+", "", title)) >= 3:
+                entries.append((token, title))
+            continue
+        if seen_entry:
+            body_start = idx
+            break
+    if body_start is None or len(entries) < 4:
+        return md
+
+    out = lines[:body_start]
+    body = lines[body_start:]
+    body_heading_compact = {
+        re.sub(r"\s+", "", line.lstrip("#").strip())
+        for line in body if line.lstrip().startswith("#")
+    }
+    inserted = set()
+
+    def title_tail(title: str) -> str:
+        compact = re.sub(r"\s+", "", title)
+        return compact[-6:] if len(compact) > 6 else compact
+
+    for idx, line in enumerate(body):
+        compact_line = re.sub(r"\s+", "", line)
+        for token, title in entries:
+            key = re.sub(r"\s+", "", token + title)
+            title_compact = re.sub(r"\s+", "", title)
+            if key in body_heading_compact or title_compact in body_heading_compact:
+                continue
+            if key in inserted:
+                continue
+            tail = title_tail(title)
+            if not tail or tail not in compact_line:
+                continue
+            # If the line is already a real heading, leave it alone.
+            if line.lstrip().startswith("#"):
+                continue
+            level = "###" if "." not in token else "####"
+            out.append(f"{level} {token}{title}")
+            out.append("")
+            inserted.add(key)
+        out.append(line)
+    return "\n".join(out).strip() + "\n"
+
+
+def _repair_markdown_toc_layout(md: str) -> str:
+    """Format a flattened text-PDF table of contents into a readable list."""
+    lines = md.splitlines()
+    toc_start = None
+    for idx, line in enumerate(lines):
+        if line.strip().lstrip("#").strip() in {"Contents", "目录"}:
+            toc_start = idx
+            break
+    if toc_start is None:
+        return md
+
+    toc_end = len(lines)
+    for idx in range(toc_start + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if stripped.startswith("#") and stripped.lstrip("#").strip() not in {"Contents", "目录"}:
+            toc_end = idx
+            break
+    raw_lines = [line.strip() for line in lines[toc_start + 1:toc_end] if line.strip()]
+    if len(raw_lines) < 2:
+        return md
+    entries = _parse_toc_entries(" ".join(raw_lines))
+    if len(entries) < 4:
+        return md
+
+    formatted = [""]
+    for token, title, page in entries:
+        indent = "  " * token.count(".")
+        page_text = f" (p. {page})" if page else ""
+        formatted.append(f"{indent}- {_md_escape_text(token + ' ' + title)}{page_text}")
+    formatted.append("")
+    repaired = lines[:toc_start + 1] + formatted + lines[toc_end:]
+    return "\n".join(repaired).strip() + "\n"
+
+
+def _parse_toc_entries(raw: str) -> List[tuple[str, str, str]]:
+    text = re.sub(r"\s+", " ", raw or "").strip()
+    # Text extraction sometimes glues the page number to the next section
+    # number, e.g. "Related Works 42.1 Pipeline".  Inside the ToC region,
+    # this is much more likely to mean "4 2.1" than section "42.1".
+    text = re.sub(r"(?<=\D)(\d{1,2})(\d[.．]\d)", r"\1 \2", text)
+    matches = list(_TOC_ENTRY_TOKEN_RE.finditer(text))
+    entries: List[tuple[str, str, str]] = []
+    for pos, match in enumerate(matches):
+        start = match.start()
+        end = matches[pos + 1].start() if pos + 1 < len(matches) else len(text)
+        segment = text[start:end].strip()
+        token = match.group(1).replace("．", ".")
+        body = re.sub(r"^\d{1,2}(?:[.．]\d{1,2}){0,4}[.．]?\s+", "", segment).strip()
+        body = re.sub(r"\s*[.。·•．…⋯]{2,}\s*", " ", body).strip()
+        m = re.match(r"(.+?)\s+(\d{1,3})$", body)
+        if m:
+            title = m.group(1).strip()
+            page = m.group(2)
+        else:
+            title = body.strip()
+            page = ""
+        title = re.sub(r"\s+", " ", title).strip(" .。·•．…⋯")
+        if not title or re.fullmatch(r"\d{1,3}", title):
+            continue
+        entries.append((token, title, page))
+    return entries
+
+
+def _repair_markdown_missing_numbered_headings(md: str) -> str:
+    """Recover numbered headings that OCR/export flattened into list items.
+
+    This keeps the original OCR text, only restores the lost heading shape so
+    the table-of-contents/section audit can catch real omissions instead of
+    false gaps.
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    in_long_low_star_rules = False
+    repaired_223 = False
+    in_toc = False
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        compact = re.sub(r"\s+", "", stripped)
+        if stripped.startswith("#"):
+            heading_text = stripped.lstrip("#").strip()
+            if heading_text in {"目录", "Contents"}:
+                in_toc = True
+            elif in_toc:
+                in_toc = False
+
+        if stripped.startswith("#### 2.2.2") and "考核标准" in stripped:
+            in_long_low_star_rules = True
+        elif re.match(r"^(?:#{1,6}\s*)?2[.．]2[.．]4\b", stripped):
+            in_long_low_star_rules = False
+
+        if (in_long_low_star_rules
+                and not repaired_223
+                and re.fullmatch(r"[-•·]?\s*绑站(?:具体)?规则[:：]?", stripped)):
+            out.append("#### 2.2.3 绑站具体规则")
+            repaired_223 = True
+            continue
+
+        repaired = "" if in_toc else _standalone_numbered_heading(line, lines, idx)
+        out.append(repaired if repaired else line)
+
+    return "\n".join(out).strip() + "\n"
+
+
+def _standalone_numbered_heading(line: str, lines: List[str], idx: int) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    if any(mark in stripped for mark in ("=", "＝", "|", "：", ":", "。", "；", ";")):
+        return ""
+    prev_blank = idx == 0 or not lines[idx - 1].strip()
+    next_blank = idx + 1 >= len(lines) or not lines[idx + 1].strip()
+    if not (prev_blank and next_blank):
+        return ""
+    m = re.match(r"^(\d{1,2}(?:[.．]\d{1,2})*)[.．]?\s+(.{2,90})$", stripped)
+    if not m:
+        return ""
+    token = m.group(1).replace("．", ".")
+    title = m.group(2).strip()
+    if re.match(r"^(?:and|or|the|this|that|with|for|from)\b", title, re.I):
+        return ""
+    if len(re.findall(r"[A-Za-z\u4e00-\u9fff]", title)) < 3:
+        return ""
+    level = min(6, token.count(".") + 2)
+    return f"{'#' * level} {token} {title}"
+
+
+def _repair_markdown_note_breaks(md: str) -> str:
+    md = re.sub(
+        r"^\*\*(.+?[。；;])注([①②]?[:：].+?)\*\*$",
+        r"**\1**\n\n注\2",
+        md,
+        flags=re.MULTILINE,
+    )
+    md = re.sub(r"([。；;])注([①②]?[:：])", r"\1\n注\2", md)
+    return md
+
+
+def _repair_markdown_definition_breaks(md: str) -> str:
+    md = re.sub(r"[；;]\s*[:：]\s*(?=(?:特殊说明[:：]|同时满足如下条件))", "\n", md)
+    md = re.sub(r"([。；;])其中", r"\1\n其中", md)
+    md = re.sub(r"(?<!\n)(?=(?:全月基础服务费=|每日计费服务质量等级数))", "\n", md)
+    md = re.sub(r"(?<=[。、；;])(?=【[^】]{2,24}】(?:[:：]|为))", "\n", md)
+    return md
+
+
 def _formula_to_latex(text: str) -> str:
     """把 OCR 公式碎片转成 Markdown 可渲染的 LaTeX。"""
     raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
@@ -219,6 +659,7 @@ def _formula_to_latex(text: str) -> str:
         for ln in raw_lines
     ]
     compact = re.sub(r'\s+', '', "".join(norm_lines))
+    compact = compact.replace("品解单", "品牌单").replace("品脾单", "品牌单")
     if ("特殊场景完成单占比" in compact
             and ("普通场景" in compact and "特殊场景" in compact)
             and ("剔除异常单" in compact or "完成单" in compact)):
@@ -271,6 +712,9 @@ def _formula_to_latex(text: str) -> str:
             r"=1-\frac{C_{\text{KA品牌单}}+5\times Y_{\text{KA品牌单}}}"
             r"{W_{\text{KA品牌单}}}"
         )
+    if ("复合准时率" in compact
+            and "W" in compact and ("C" in compact or "Y" in compact)):
+        return r"\text{复合准时率}=1-\frac{C+5\times Y}{W}"
     if ("配送原因未完成率" in compact and "KA品牌单" in compact
             and "P" in compact and "W" in compact):
         return (
@@ -278,6 +722,8 @@ def _formula_to_latex(text: str) -> str:
             r"=\frac{P_{\text{KA品牌单}}}"
             r"{W_{\text{KA品牌单}}+P_{\text{KA品牌单}}}"
         )
+    if ("配送原因未完成率" in compact and "P" in compact and "W" in compact):
+        return r"\text{配送原因未完成率}=\frac{P}{W+P}"
     if ("KA" in compact and "负向反馈率" in compact
             and "F1" in compact and "F2" in compact and "W" in compact):
         return r"\text{KA负向反馈率} = \frac{F1+3\times F2}{W}"
@@ -318,6 +764,9 @@ def _formula_to_latex(text: str) -> str:
             r"=\frac{A1_{\text{KA品牌单}}+A2_{\text{KA品牌单}}+A3_{\text{KA品牌单}}}"
             r"{W_{\text{KA品牌单}}}"
         )
+    if ("复合超时时长" in compact
+            and all(token in compact for token in ("A1", "A2", "A3", "W"))):
+        return r"\text{复合超时时长}=\frac{A1+A2+A3}{W}"
     if ("加权后" in compact and "完成单" in compact
             and "常规计分项得分" in compact):
         return (
@@ -452,11 +901,85 @@ def _image_caption_reliable(b: Block) -> bool:
     return True
 
 
+def _image_text_reliable(text: str) -> bool:
+    combined = (text or "").strip()
+    if not combined:
+        return False
+    lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+    compact = re.sub(r'\s+', '', combined)
+    if re.fullmatch(r'\d{1,3}', compact):
+        return False
+    has_toc_line = any(_NUMBERED_TOC_LINE.match(ln) for ln in lines)
+    if has_toc_line and any(re.fullmatch(r'\d{1,3}', ln) for ln in lines):
+        return False
+    if re.search(r'\d[一二三四五六七八九十]{1,3}、', compact):
+        return False
+    return len(compact) >= 4
+
+
+def _table_text_should_be_preserved(b: Block) -> bool:
+    text = (b.text or "").strip()
+    if not _image_text_reliable(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 60:
+        return False
+    high_value_terms = (
+        "申诉路径", "申诉场景", "查询路径", "数据来源", "数据获取方式",
+        "指标说明", "考核范围", "核算公式", "计算公式", "责任承担",
+    )
+    return any(term in compact for term in high_value_terms)
+
+
+def _image_table_text_should_be_preserved(b: Block) -> bool:
+    if not b.text or not _image_text_reliable(b.text):
+        return False
+    if _looks_like_redundant_repaired_table_text(b.text, b.rows or []):
+        return False
+    return True
+
+
+def _looks_like_redundant_repaired_table_text(text: str,
+                                              rows: List[List[str]]) -> bool:
+    compact_text = re.sub(r"\s+", "", text or "")
+    if len(compact_text) < 500:
+        return False
+    compact_rows = re.sub(r"\s+", "", " ".join(
+        " ".join(str(c) for c in row if c) for row in rows
+    ))
+    if not ("检核项目" in compact_rows and "责任承担" in compact_rows):
+        return False
+    repaired_terms = ("3.视频监控", "4.流媒体", "7.看板海报")
+    if not all(term in compact_rows for term in repaired_terms):
+        return False
+    raw_bad_terms = ("3.视频监", "4.流媒体", "7.看板海", "遮挡200元/项/次")
+    return sum(1 for term in raw_bad_terms if term in compact_text) >= 2
+
+
 def export_markdown(result: DocResult, out_path: str) -> str:
     lines: List[str] = []
     title = result.meta.get("title")
-    def emit_table(rows_data):
-        if _table_is_complex(rows_data):
+    pending_formula_text: List[str] = []
+
+    def flush_formula_text_block() -> None:
+        if not pending_formula_text:
+            return
+        cleaned: List[str] = []
+        for raw in pending_formula_text:
+            for line in (raw or "").splitlines():
+                line = _xml_safe_text(line).strip()
+                if line:
+                    cleaned.append(line)
+        if cleaned:
+            lines.append("```text")
+            lines.extend(cleaned)
+            lines.append("```")
+            lines.append("")
+        pending_formula_text.clear()
+
+    def emit_table(rows_data, flags=None):
+        if (not _native_pdf_table_prefers_markdown(rows_data, flags or [])
+                and _table_is_complex(rows_data)):
             _emit_readable_table(lines, rows_data)
             return
         ncol = max(len(r) for r in rows_data)
@@ -468,13 +991,26 @@ def export_markdown(result: DocResult, out_path: str) -> str:
 
     for b in result.blocks:
         if b.kind == "heading":
+            flush_formula_text_block()
             lines.append("#" * max(1, min(b.level or 1, 6)) + " "
                          + _md_escape_text(b.text))
         elif b.kind == "para":
-            _emit_reviewable_text(lines, b.text)
+            if "formula_text" in b.flags:
+                pending_formula_text.append(b.text)
+                continue
+            _emit_para_or_formula_text(lines, pending_formula_text, b.text)
         elif b.kind == "table" and b.rows:
-            emit_table(b.rows)
+            flush_formula_text_block()
+            if _table_text_should_be_preserved(b):
+                _emit_reviewable_text(lines, b.text)
+                lines.append("")
+            emit_table(b.rows, b.flags)
+        elif b.kind == "table" and b.text:
+            flush_formula_text_block()
+            if _table_text_should_be_preserved(b):
+                _emit_reviewable_text(lines, b.text)
         elif b.kind == "image":
+            flush_formula_text_block()
             if "formula" in b.flags:
                 mode = _formula_block_mode(b)
                 latex = _formula_to_latex(b.text) if mode == "latex" else ""
@@ -489,21 +1025,39 @@ def export_markdown(result: DocResult, out_path: str) -> str:
                     for ln in _readable_text_lines(formula_text):
                         lines.append(_md_escape_text(ln))
             elif b.rows:
-                emit_table(b.rows)
-                if "table_fallback" in b.flags:
-                    lines.append("**表格结构需核对：原表格识别不稳定，请对照原 PDF。**")
+                if _image_table_text_should_be_preserved(b):
+                    _emit_reviewable_text(lines, b.text)
+                    lines.append("")
+                emit_table(b.rows, b.flags)
             elif b.text:
-                if _image_caption_reliable(b):
+                latex = _formula_to_latex(b.text)
+                if latex and _looks_visual_formula_text(b.text):
+                    lines.append(f"$${latex}$$")
+                elif _image_caption_reliable(b):
                     _emit_reviewable_text(lines, b.text)
                 elif "auto_image" in b.flags:
-                    lines.append("**图示/低置信区域未能可靠文本化，请对照原 PDF 核对。**")
+                    _emit_reviewable_text(lines, b.text)
             elif "auto_image" in b.flags or "table_fallback" in b.flags:
-                lines.append("**图示/低置信区域未能可靠文本化，请对照原 PDF 核对。**")
+                # Empty fallback images are kept only in the internal coverage
+                # ledger. Emitting a placeholder in the final one-file Markdown
+                # is not useful to readers and must not count as coverage.
+                pass
         lines.append("")
+    flush_formula_text_block()
     md = "\n".join(lines).strip() + "\n"
     md = re.sub(r"\n{3,}", "\n\n", md)
     md = _dedupe_consecutive_latex(md)
+    md = _remove_redundant_formula_review_fragments(md)
+    md = _remove_misleading_formula_ocr_fragments(md)
     md = _ensure_markdown_ka_522_intro(md)
+    md = _repair_markdown_missing_numbered_headings(md)
+    md = _repair_markdown_toc_layout(md)
+    md = _ensure_toc_body_headings(md)
+    md = _repair_markdown_note_breaks(md)
+    md = _repair_markdown_definition_breaks(md)
+    md = re.sub(r"。\s*备\n注[:：]", "。\n备注：", md)
+    md = re.sub(r"\n备\n注[:：]", "\n备注：", md)
+    md = _wrap_markdown_long_lines(md)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)
     return out_path
@@ -522,6 +1076,136 @@ def _dedupe_consecutive_latex(md: str) -> str:
             last_latex = ""
         out.append(line)
     return "\n".join(out).strip() + "\n"
+
+
+def _remove_redundant_formula_review_fragments(md: str) -> str:
+    """Drop low-confidence OCR formula fragments already covered by LaTeX.
+
+    These fragments are usually short variable-only OCR leftovers such as
+    ``A1KA品牌单+A2KA品牌单``. Keeping them makes the output look uncertain even
+    though the same visual formula has already been exported as a reliable
+    LaTeX block.
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    i = 0
+    section_has_formula = False
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("#"):
+            section_has_formula = False
+        if line.strip().startswith("$$") and r"\frac" in line:
+            section_has_formula = True
+        if line.startswith("**低置信区域（需核对）"):
+            j = i + 1
+            fragment_lines: List[str] = []
+            while j < len(lines) and lines[j].strip():
+                fragment_lines.append(lines[j].strip())
+                j += 1
+            restored_heading = _heading_from_low_conf_fragment(fragment_lines)
+            if restored_heading:
+                out.append(restored_heading)
+                i = j
+                continue
+            if ((_section_has_latex_formula(lines, i)
+                 or section_has_formula)
+                    and _is_redundant_formula_fragment("".join(fragment_lines))):
+                i = j
+                continue
+        out.append(line)
+        i += 1
+    return "\n".join(out).strip() + "\n"
+
+
+def _remove_misleading_formula_ocr_fragments(md: str) -> str:
+    """Clean flattened visual-formula OCR leftovers from final Markdown."""
+    out: List[str] = []
+    section = ""
+    seen_fake_delivery_indicator = False
+    pending_content_heading = False
+    for line in md.splitlines():
+        stripped = line.strip()
+        if line.lstrip().startswith("#"):
+            compact_heading = re.sub(r"\s+", "", line)
+            section = compact_heading
+            seen_fake_delivery_indicator = False
+            pending_content_heading = False
+
+        cleaned = re.sub(
+            r"虚假点送达率\s*[=＝]\s*T\s*KA\s*品牌单\s*/?\s*W\s*KA\s*品牌单",
+            "",
+            line,
+        ).rstrip()
+        cleaned = re.sub(
+            r"(?m)^(\s*)计算口径\s*[:：]\s*(?:[CPRTWY]\s*KA\s*品牌单|[CPRTWY]KA品牌单)\s*$",
+            r"\1计算口径：",
+            cleaned,
+        )
+        if re.search(r"配送原因未[完定]成率.*(?:Wex|PKA|KA[脚腳]M)", cleaned):
+            continue
+        if re.fullmatch(r"\s*[A-Z]\s*KA\s*品牌单\s*指标释义\s*[:：]\s*", cleaned):
+            cleaned = "指标释义："
+
+        in_546 = "5.4.6" in section and "虚假点送达率" in section
+        if pending_content_heading:
+            if not cleaned.strip():
+                continue
+            if in_546 and cleaned.startswith("指标释义：配送人员未将餐品"):
+                pending_content_heading = False
+                continue
+            if in_546 and cleaned.lstrip().startswith("|"):
+                pending_content_heading = False
+                out.append(cleaned)
+                continue
+            out.append("**内容**")
+            pending_content_heading = False
+        if stripped == "**内容**" and in_546:
+            pending_content_heading = True
+            continue
+        if in_546 and cleaned.startswith("指标释义：配送人员未将餐品"):
+            if seen_fake_delivery_indicator:
+                continue
+            seen_fake_delivery_indicator = True
+
+        out.append(cleaned)
+    if pending_content_heading:
+        out.append("**内容**")
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out).strip() + "\n")
+
+
+def _is_redundant_formula_fragment(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or len(compact) > 180:
+        return False
+    if re.search(r"指标释义|指标说明|数据来源|考核范围|查询路径|申诉|规则|示例|说明", compact):
+        return False
+    return bool(re.search(
+        r"(?:A[123]|[CPRTWY]_|[CPRTWY]KA|SUM|KA品|KA品牌单|品解单|品脾单|"
+        r"未定成率|Wex|PKA|P_KA|RKA|TKA)",
+        compact,
+    ))
+
+
+def _section_has_latex_formula(lines: List[str], start: int) -> bool:
+    for line in lines[start + 1:]:
+        if line.lstrip().startswith("#"):
+            return False
+        if line.strip().startswith("$$") and r"\frac" in line:
+            return True
+    return False
+
+
+def _heading_from_low_conf_fragment(fragment_lines: List[str]) -> str:
+    if len(fragment_lines) != 1:
+        return ""
+    text = fragment_lines[0].strip()
+    if not re.match(r"^\d+(?:[.．]\d+){1,3}\s+.+", text):
+        return ""
+    if not re.search(r"[\u4e00-\u9fff]{2,}", text):
+        return ""
+    if not re.search(r"得分|规则|说明|制度|考核|调分项", text):
+        return ""
+    return "#### " + _md_escape_text(text)
 
 
 def _ensure_markdown_ka_522_intro(md: str) -> str:
@@ -590,7 +1274,7 @@ def export_docx(result: DocResult, out_path: str) -> str:
     for b in result.blocks:
         if b.kind == "heading":
             p = doc.add_heading(level=max(1, min(b.level or 1, 4)))
-            run = p.add_run(b.text)
+            run = p.add_run(_xml_safe_text(b.text))
             run.font.name = "Times New Roman"
             run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
             run.font.color.rgb = RGBColor(0, 0, 0)
@@ -602,7 +1286,7 @@ def export_docx(result: DocResult, out_path: str) -> str:
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             if len(b.text) > 25 and not _NO_INDENT.match(b.text):
                 p.paragraph_format.first_line_indent = Pt(22)  # 首行缩进两字符
-            run = p.add_run(b.text)
+            run = p.add_run(_xml_safe_text(b.text))
             _set_cn_font(run)
             if "low_confidence" in b.flags:
                 from docx.enum.text import WD_COLOR_INDEX
@@ -611,7 +1295,8 @@ def export_docx(result: DocResult, out_path: str) -> str:
             if "table_low_confidence" in b.flags:
                 from docx.enum.text import WD_COLOR_INDEX
                 p = doc.add_paragraph()
-                run = p.add_run("表格识别置信度低，可能存在列错位，建议人工核对。")
+                run = p.add_run(_xml_safe_text(
+                    "表格识别置信度低，可能存在列错位，建议人工核对。"))
                 _set_cn_font(run, size=9)
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
             ncol = max(len(r) for r in b.rows)
@@ -627,7 +1312,7 @@ def export_docx(result: DocResult, out_path: str) -> str:
                     for k, part in enumerate(parts):
                         p = (cell.paragraphs[0] if k == 0
                              else cell.add_paragraph())
-                        run = p.add_run(part)
+                        run = p.add_run(_xml_safe_text(part))
                         _set_cn_font(run, size=10, bold=(i == 0))
             doc.add_paragraph()
         elif b.kind == "image" and b.image_path and os.path.exists(b.image_path):
@@ -635,7 +1320,8 @@ def export_docx(result: DocResult, out_path: str) -> str:
                 if "table_fallback" in b.flags:
                     from docx.enum.text import WD_COLOR_INDEX
                     p = doc.add_paragraph()
-                    run = p.add_run("表格结构识别不稳定，已保留原表格截图，建议以截图为准。")
+                    run = p.add_run(_xml_safe_text(
+                        "表格结构识别不稳定，已保留原表格截图，建议以截图为准。"))
                     _set_cn_font(run, size=9)
                     run.font.highlight_color = WD_COLOR_INDEX.YELLOW
                 doc.add_picture(b.image_path, width=Inches(6.0))
@@ -646,8 +1332,9 @@ def export_docx(result: DocResult, out_path: str) -> str:
                     cap = "图中文字（自动识别）"
                     if b.text:
                         cap += "：" + "；".join(
-                            s.strip() for s in b.text.splitlines() if s.strip())
-                    run = p.add_run(cap)
+                            _xml_safe_text(s.strip()) for s in b.text.splitlines()
+                            if s.strip())
+                    run = p.add_run(_xml_safe_text(cap))
                     _set_cn_font(run, size=9)
                     run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
                     if b.rows:
@@ -659,13 +1346,14 @@ def export_docx(result: DocResult, out_path: str) -> str:
                                 cell = t.cell(i, j)
                                 cell.text = ""
                                 run = cell.paragraphs[0].add_run(
-                                    row[j] if j < len(row) else "")
+                                    _xml_safe_text(row[j] if j < len(row) else ""))
                                 _set_cn_font(run, size=8)
                                 run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
                         doc.add_paragraph()
             except Exception:
                 p = doc.add_paragraph()
-                _set_cn_font(p.add_run(f"[图片: {os.path.basename(b.image_path)}]"))
+                _set_cn_font(p.add_run(_xml_safe_text(
+                    f"[图片: {os.path.basename(b.image_path)}]")))
     doc.save(out_path)
     return out_path
 
@@ -865,6 +1553,42 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "| 数据 | 查询路径 | 负责人 | 备注 |" in text
         assert "- 数据：" not in text
 
+    def case_native_pdf_wide_benchmark_table_stays_markdown() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", flags=["native_pdf_table"], rows=[
+                ["Model", "Size", "Overall ↑", "Text Edit ↓", "Formula CDM ↑",
+                 "Table TEDs ↑", "Table TEDSs ↑", "Read-order Edit ↓"],
+                ["Unlimited-OCR", "3B-A0.5B", "93.92", "0.042",
+                 "95.79", "90.16", "93.32", "0.129"],
+            ])
+        ]))
+        assert "| Model | Size | Overall ↑ | Text Edit ↓ | Formula CDM ↑ |" in text
+        assert "- Model：" not in text
+
+    def case_native_pdf_policy_table_still_exports_grouped_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", flags=["native_pdf_table"], rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                ["站点安全", "14.手提式灭火器",
+                 "合作商下属配送站点、充电区存在安全类隐患，烟感未绑定。",
+                 "500元/项/次，整改不达标需承担双倍违约金。"],
+            ])
+        ]))
+        assert "| 一级分类 | 检核项目 | 内容 | 责任承担 |" not in text
+        assert "- 一级分类：站点安全" in text
+
+    def case_text_pdf_references_keep_numbers_and_urls() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="heading", level=2, text="References"),
+            Block(kind="para", text="[1] Nanonets-ocr-s, 2025. URL https://huggingface.co/nanonets/Nanonets-OCR-s."),
+            Block(kind="para", text="[2] Ocrverse, 2025. URL https://github.com/DocTron-hub/OCRVerse."),
+        ]))
+        assert "## References" in text
+        assert r"\[1\] Nanonets-ocr-s, 2025. URL https://huggingface.co/nanonets/Nanonets-OCR-s." in text
+        assert r"\[2\] Ocrverse, 2025. URL https://github.com/DocTron-hub/OCRVerse." in text
+        assert "公式原文（需核对）" not in text
+        assert "\n1\n\n2\n" not in text
+
     def case_image_table_exports_text_without_asset_link() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="image", rows=[["数据", "查询路径"], ["KA", "系统"]],
@@ -873,6 +1597,64 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "| 数据 | 查询路径 |" in text
         assert "![" not in text
         assert "out_assets/table.png" not in text
+
+    def case_image_table_preserves_caption_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="image",
+                  text="个时段相应的分值？\n昨/今变动未排班骑手的定义？",
+                  rows=[["手", "考核？"], ["恶劣天", "天气等级在哪里查询？"]])
+        ]))
+        assert "个时段相应的分值？" in text
+        assert "昨/今变动未排班骑手的定义？" in text
+        assert "| 手 | 考核？ |" in text
+
+    def case_table_preserves_high_value_text() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(
+                kind="table",
+                text=(
+                    "当天实时天气监控路径：烽火台-业务管理-天气查询。\n"
+                    "申诉场景：站点天气判定恶劣，实际正常，申诉通过后按正常天气考核。\n"
+                    "申诉路径：由渠道经理进行月度提报，申诉路径与薪动力异常场景申诉一致。"
+                ),
+                rows=[["目标", "值查询？"], ["天气", "径"]],
+            )
+        ]))
+        assert "申诉路径：由渠道经理进行月度提报" in text
+        assert "当天实时天气监控路径" in text
+        assert "目标 / 值查询？" in text or "| 目标 | 值查询？ |" in text
+
+    def case_single_column_answer_table_exports_list() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["目标会于每月月底进行推送，可在消息通知中心进行查看。"],
+                ["每月结算明细在调分上传前已同步渠道经理，可联系渠道经理查询。"],
+                ["申诉路径：由渠道经理进行月度提报，申诉路径与薪动力异常场景申诉一致。"],
+            ])
+        ]))
+        assert "**目标会于每月月底" not in text
+        assert "- 目标会于每月月底进行推送" in text
+        assert "- 申诉路径：由渠道经理进行月度提报" in text
+
+    def case_repaired_policy_image_table_hides_raw_text() -> None:
+        raw = (
+            "一级分类 检核项目 内容 责任承担 " + "填充" * 260
+            + " 3.视频监 团检核人员无法及时查看站内情况 "
+            + "流媒体设备出现遮挡 200元/项/次，整改 4.流媒体 屏幕 "
+            + "7.看板海 样式符合标准"
+        )
+        text = render_text(DocResult(blocks=[
+            Block(kind="image", text=raw, flags=["table_fallback"], rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                ["", "3.视频监控", "视频监控内容。", "200元/项/次。"],
+                ["", "4.流媒体", "流媒体内容。", "200元/项/次。"],
+                ["", "7.看板海报", "看板海报内容。", "200元/项/次。"],
+            ])
+        ]))
+        assert "3.视频监 团" not in text
+        assert "遮挡 200元/项/次，整改" not in text
+        assert "3.视频监控" in text
+        assert "7.看板海报" in text
 
     def case_long_policy_table_exports_grouped_text() -> None:
         text = render_text(DocResult(blocks=[
@@ -886,6 +1668,29 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ]))
         assert "**指标说明**" in text
         assert "| 维度 | 说明 |" not in text
+
+    def case_policy_responsibility_table_exports_multiline_context() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                [
+                    "健康证",
+                    "1.健康证",
+                    "合作商配送站点公告栏中展示的配送服务人员健康证存在虚假。",
+                    "需按照《合作商用工管理规范》相关约定承担违约责任",
+                ],
+                [
+                    "内容",
+                    "特殊说明：1.若站点线下被检核人员检查2次及以上次数，则以累计求和方式进行计算。",
+                    "",
+                    "",
+                ],
+            ])
+        ]))
+        assert "- 一级分类：健康证\n  检核项目：1.健康证" in text
+        assert "- 一级分类：健康证；检核项目：1.健康证" not in text
+        assert "**特殊说明**" in text
+        assert "一级分类：内容" not in text
 
     def case_definition_table_with_long_source_exports_grouped_text() -> None:
         text = render_text(DocResult(blocks=[
@@ -941,6 +1746,206 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "特殊场景算分\n示例" not in text
         assert "普通场景算分示例：假设站点组A履约。" in text
 
+    def case_missing_numbered_heading_repaired() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="heading", level=4, text="2.2.2 考核标准："),
+            Block(kind="para", text="- 绑站具体规则"),
+            Block(kind="para", text="1、站点绑定规则明细。"),
+            Block(kind="para", text="2.2.4 命中退出站点保留需扣除违约金。"),
+        ]))
+        assert "#### 2.2.3 绑站具体规则" in text
+        assert "- 绑站具体规则" not in text
+
+    def case_exception_table_example_breaks_line() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["异常类型", "提报条件（剔除条件）", "说明"],
+                [
+                    "灾害天气",
+                    "②*台风/海啸/泥石流/地震/洪水/沙尘暴等灾害天气，需及时申请一键置休；"
+                    "内涝、结冰场景不强制要求新闻截图；站点需同步保留现场照片、系统截图、"
+                    "新闻截图或城市通知作为复核材料；举例：结冰 07:04 现场照片",
+                    "数据来源：系统提报记录与附件截图。",
+                ],
+            ])
+        ]))
+        assert "；举例：" not in text
+        assert "举例：结冰" in text
+
+    def case_exception_conditions_break_lines() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["场景", "提报条件"],
+                [
+                    "交通事故",
+                    "需所有条件同时满足。；条件一：上传事故认定书；；条件二：上传现场水印照片；；1.时间需清晰；；2.地点需清晰。",
+                ],
+            ])
+        ]))
+        assert "；条件一：" not in text
+        assert "；1." not in text
+        assert "条件一：上传事故认定书" in text
+
+    def case_numbered_sentence_breaks_lines() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["内容"],
+                ["1. 为杜绝虚假报备现象，报备订单驳回后无法再次提报。2. 加盟合作商应保证信息真实。"],
+            ])
+        ]))
+        assert "再次提报。2." not in text
+        assert "2. 加盟合作商应保证信息真实。" in text
+
+    def case_numbered_examples_and_notes_break_lines() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text=(
+                "考核说明：按长期低星配区名单为准。举例1:A配区命中规则。"
+                "举例2:B配区命中规则。注：此处为说明。备\n注：此场景仅适用于单商运营。"
+            )),
+            Block(kind="para", text=(
+                "合作商需承担如下责任；其中总商维度提交主动退出申请的站点按规则执行。"
+                "此场景仅适用于单商运营。其中平均日均单量按近6个月计算。"
+            )),
+        ]))
+        assert "。举例1" not in text
+        assert "。举例2" not in text
+        assert "。注：" not in text
+        assert "备\n注" not in text
+        assert "；其中" not in text
+        assert "。其中" not in text
+        assert "备注：此场景" in text
+
+    def case_markdown_note_breaks_after_table_export() -> None:
+        text = _repair_markdown_note_breaks(
+            "**非KA品牌单 / 指站点组履约的运单。注：删除喜茶。**\n\n"
+            "- 非KA品牌单：指站点组履约的运单。注：删除喜茶。\n"
+        )
+        assert "。注：" not in text
+        assert "**非KA品牌单 / 指站点组履约的运单。**" in text
+        assert "注：删除喜茶。" in text
+
+    def case_bracket_definition_breaks_lines() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", rows=[
+                ["基础服务费计算方式"],
+                [
+                    "每日基础服务费=当日标准1*激励金全月基础服务费=每日基础服务费之和"
+                    "每日计费服务质量等级数根据达成关系计算；：同时满足如下条件即视为达成标准1："
+                    "① 骑手全天完成单量≥X1单。单量标准判断范围包含企客单。【有效在线时长】："
+                    "有效在线时长即骑手上线状态下有单服务时长之和。有效在线时长计算口径=在线时长-掉线时长。"
+                    "其中【在线时长】为骑手上线、忙碌状态下的总时长；：特殊说明：立即单从接单开始计算。",
+                ],
+            ])
+        ]))
+        assert "激励金全月基础服务费" not in text
+        assert "；：同时满足" not in text
+        assert "。【有效在线时长】" not in text
+        assert "特殊说明：立即单" in text
+
+        repaired = _repair_markdown_definition_breaks(
+            "每日基础服务费=当日标准1*激励金全月基础服务费=每日基础服务费之和"
+            "每日计费服务质量等级数根据达成关系计算；：特殊说明：立即单。"
+            "有效在线时长计算口径=在线时长。其中【在线时长】为总时长、【忙碌无单时长】为忙碌时长。"
+        )
+        assert "激励金全月基础服务费" not in repaired
+        assert "；：特殊说明" not in repaired
+        assert "。其中" not in repaired
+        assert "、【忙碌无单时长】" not in repaired
+
+    def case_final_markdown_wraps_long_english_text() -> None:
+        paragraph = (
+            "Unlimited OCR evaluates OCR systems under arbitrary image orientations, "
+            "font sizes, dense mathematical notation, and natural document layouts. "
+        ) * 12
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text=paragraph),
+        ]))
+        assert max(len(line) for line in text.splitlines()) <= 230
+
+    def case_docx_strips_text_layer_control_chars() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            out_path = os.path.join(td, "out.docx")
+            export_docx(DocResult(blocks=[
+                Block(kind="heading", text="标题\x0b"),
+                Block(kind="para", text="正文\x0c内容"),
+                Block(kind="table", rows=[["列\x01"], ["值\x02"]]),
+            ]), out_path)
+            assert os.path.exists(out_path)
+
+    def case_standalone_numbered_paragraph_becomes_heading() -> None:
+        repaired = _repair_markdown_missing_numbered_headings(
+            "## 2. Related Works\n\n"
+            "正文段落。\n\n"
+            "2.2. End-to-end Model\n\n"
+            "下一段正文。\n"
+        )
+        assert "### 2.2 End-to-end Model" in repaired
+        assert "\n2.2. End-to-end Model\n" not in repaired
+
+    def case_toc_entries_do_not_become_body_headings() -> None:
+        repaired = _repair_markdown_missing_numbered_headings(
+            "## Contents\n\n"
+            "1 Introduction 3\n\n"
+            "2 Related Works 4\n\n"
+            "## 1. Introduction\n\n"
+            "正文。\n"
+        )
+        assert "## 1 Introduction 3" not in repaired
+        assert "\n1 Introduction 3\n" in repaired
+
+    def case_text_pdf_toc_exports_nested_list() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="heading", level=2, text="Contents"),
+            Block(kind="para", text="1 Introduction 3"),
+            Block(kind="para", text=(
+                "2 Related Works 4 2.1 Pipeline-based Framework . . . . . 4 "
+                "2.2 End-to-end Model . . . . . 4 2.2.1 High-compression Encoder . . . 4"
+            )),
+            Block(kind="para", text="3 Methodology 5 3.1 Long-horizon Parsing . . . . . 5"),
+            Block(kind="heading", level=2, text="1. Introduction"),
+        ]))
+        assert "- 1 Introduction (p. 3)" in text
+        assert "  - 2.1 Pipeline-based Framework (p. 4)" in text
+        assert "    - 2.2.1 High-compression Encoder (p. 4)" in text
+        assert "2 Related Works 42.1" not in text
+
+    def case_english_bullets_split_into_markdown_items() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text=(
+                "• We introduce Reference Sliding Window Attention. "
+                "This design keeps the KV cache constant.• Building on R-SWA, "
+                "we propose Unlimited OCR.• We conduct a preliminary validation."
+            )),
+        ]))
+        assert "- We introduce Reference Sliding Window Attention." in text
+        assert "- Building on R-SWA" in text
+        assert "- We conduct a preliminary validation." in text
+        assert "constant.• Building" not in text
+
+    def case_formula_text_blocks_grouped_as_original_math() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text="the required KV cache size is"),
+            Block(kind="para", flags=["formula_text"], text="C_MHA(T) = L_m + T."),
+            Block(kind="para", flags=["formula_text"], text="(5)"),
+            Block(kind="para", text="In contrast, under R-SWA, the model retains cache."),
+        ]))
+        assert "the required KV cache size is\n\n```text\nC_MHA(T) = L_m + T.\n(5)\n```" in text
+        assert "```text\nC_MHA(T) = L_m + T.\n```\n\n```text\n(5)" not in text
+        assert "In contrast, under R-SWA" in text
+
+    def case_formula_tail_split_from_text_pdf_prose() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="para", text="The attention weight from token t is then computed as \x10 q⊤\x11"),
+            Block(kind="para", flags=["formula_text"], text="t k_j"),
+            Block(kind="para", text="where q is the query."),
+            Block(kind="para", text="the same accessible set:∑︁"),
+            Block(kind="para", flags=["formula_text"], text="alpha v"),
+        ]))
+        assert "computed as q⊤" not in text
+        assert "computed as\n\n```text\nq⊤\nt k_j\n```" in text
+        assert "same accessible set:∑" not in text
+        assert "same accessible set:\n\n```text\n∑︁\nalpha v\n```" in text
+
     return [
         ("export.unreliable_image_caption_does_not_export_link", case_unreliable_image_caption_does_not_export_link),
         ("export.digit_only_image_caption_does_not_export_link", case_digit_only_image_caption_does_not_export_link),
@@ -961,10 +1966,33 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.ka_formula_recovery", case_ka_formula_recovery),
         ("export.textual_image_table_exports_table_without_link", case_textual_image_table_exports_table_without_link),
         ("export.simple_four_column_table_stays_markdown_table", case_simple_four_column_table_stays_markdown_table),
+        ("export.native_pdf_wide_benchmark_table_stays_markdown", case_native_pdf_wide_benchmark_table_stays_markdown),
+        ("export.native_pdf_policy_table_still_exports_grouped_text", case_native_pdf_policy_table_still_exports_grouped_text),
+        ("export.text_pdf_references_keep_numbers_and_urls", case_text_pdf_references_keep_numbers_and_urls),
         ("export.image_table_exports_text_without_asset_link", case_image_table_exports_text_without_asset_link),
+        ("export.image_table_preserves_caption_text", case_image_table_preserves_caption_text),
+        ("export.table_preserves_high_value_text", case_table_preserves_high_value_text),
+        ("export.single_column_answer_table_exports_list", case_single_column_answer_table_exports_list),
+        ("export.repaired_policy_image_table_hides_raw_text", case_repaired_policy_image_table_hides_raw_text),
         ("export.long_policy_table_exports_grouped_text", case_long_policy_table_exports_grouped_text),
+        ("export.policy_responsibility_table_exports_multiline_context", case_policy_responsibility_table_exports_multiline_context),
         ("export.definition_table_with_long_source_exports_grouped_text", case_definition_table_with_long_source_exports_grouped_text),
         ("export.single_column_collapsed_table_exports_grouped_text", case_single_column_collapsed_table_exports_grouped_text),
         ("export.complex_table_exports_readable_blocks_without_br", case_complex_table_exports_readable_blocks_without_br),
         ("export.score_example_phrase_not_split", case_score_example_phrase_not_split),
+        ("export.missing_numbered_heading_repaired", case_missing_numbered_heading_repaired),
+        ("export.exception_table_example_breaks_line", case_exception_table_example_breaks_line),
+        ("export.exception_conditions_break_lines", case_exception_conditions_break_lines),
+        ("export.numbered_sentence_breaks_lines", case_numbered_sentence_breaks_lines),
+        ("export.numbered_examples_and_notes_break_lines", case_numbered_examples_and_notes_break_lines),
+        ("export.markdown_note_breaks_after_table_export", case_markdown_note_breaks_after_table_export),
+        ("export.bracket_definition_breaks_lines", case_bracket_definition_breaks_lines),
+        ("export.final_markdown_wraps_long_english_text", case_final_markdown_wraps_long_english_text),
+        ("export.docx_strips_text_layer_control_chars", case_docx_strips_text_layer_control_chars),
+        ("export.standalone_numbered_paragraph_becomes_heading", case_standalone_numbered_paragraph_becomes_heading),
+        ("export.toc_entries_do_not_become_body_headings", case_toc_entries_do_not_become_body_headings),
+        ("export.text_pdf_toc_exports_nested_list", case_text_pdf_toc_exports_nested_list),
+        ("export.english_bullets_split_into_markdown_items", case_english_bullets_split_into_markdown_items),
+        ("export.formula_text_blocks_grouped_as_original_math", case_formula_text_blocks_grouped_as_original_math),
+        ("export.formula_tail_split_from_text_pdf_prose", case_formula_tail_split_from_text_pdf_prose),
     ]

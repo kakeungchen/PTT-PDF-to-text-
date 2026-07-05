@@ -1096,9 +1096,21 @@ def _merge_table_fallback_fragments(blocks: List[Block],
             y0 = min(b.bbox[1] for b in run)
             x1 = page_w
             y1 = max(b.bbox[3] for b in run)
+            merged_rows: List[List[str]] = []
+            merged_texts: List[str] = []
+            for part in run:
+                if part.rows:
+                    merged_rows.extend(part.rows)
+                elif part.text:
+                    merged_rows.append(["内容", part.text])
+                text = _flatten_block_text(part).strip()
+                if text:
+                    merged_texts.append(text)
             flags = ["table_low_confidence", "table_fallback",
                      "merged_table_fallback"]
             out.append(Block(kind="image", page=blk.page,
+                             text="\n".join(merged_texts),
+                             rows=merged_rows or None,
                              confidence=min(b.confidence for b in run),
                              bbox=(x0, y0, x1, y1), flags=flags))
         else:
@@ -1110,7 +1122,12 @@ def _merge_table_fallback_fragments(blocks: List[Block],
         if (_is_table_fragment_block(blk)
                 and _near_table_fallback(blk, fallback_refs)
                 and not _is_table_fallback_block(blk)):
+            rows = blk.rows
+            if not rows and blk.text:
+                rows = [["内容", blk.text]]
             final.append(Block(kind="image", page=blk.page,
+                               text=_flatten_block_text(blk),
+                               rows=rows,
                                confidence=blk.confidence,
                                bbox=(0, blk.bbox[1], page_w, blk.bbox[3]),
                                flags=["table_low_confidence", "table_fallback",

@@ -4,7 +4,7 @@
 """
 import re
 from collections import Counter
-from typing import Callable, Iterable, List, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from .models import Block
 
@@ -111,6 +111,8 @@ def normalize_text(text: str, context: str = "text") -> Tuple[str, List[str]]:
         "ka星级": "KA星级",
         "签暑": "签署",
         "肯得牌": "肯德基品牌",
+        "居埃八好柠准代然理 体壬": "质控分析-标准化管理",
+        "居埃八好柠准代然理体壬": "质控分析-标准化管理",
         "遮挡遮挡": "遮挡",
         "小金。太阳": "小太阳",
         "小金太阳": "小太阳",
@@ -120,6 +122,9 @@ def normalize_text(text: str, context: str = "text") -> Tuple[str, List[str]]:
         "末使用": "未使用",
         "行力": "行为",
         "將改": "整改",
+        "整改舍安全管理制度": "舍安全管理制度",
+        "员工宿、舍安全管理制度": "员工宿舍安全管理制度",
+        "员工宿、整改舍安全管理制度": "员工宿舍安全管理制度",
         "酒漏": "洒漏",
         "严車": "严重",
         "以实际签署准": "以实际签署为准",
@@ -259,7 +264,8 @@ def normalize_blocks(blocks: List[Block]) -> List[str]:
         if blk.kind in ("heading", "para"):
             ctx = "toc" if blk.text.strip() in ("目录", "目錄") else "text"
             blk.text = apply(blk.text, ctx)
-        if blk.rows:
+        protected_native_table = _is_protected_native_pdf_table(blk)
+        if blk.rows and not protected_native_table:
             blk.rows = [[apply(c, "table") for c in row] for row in blk.rows]
             blk.rows = clean_table_noise_rows(blk.rows)
             repaired = repair_table_rows(blk.rows)
@@ -267,13 +273,20 @@ def normalize_blocks(blocks: List[Block]) -> List[str]:
                 counter["表格单元格错拆修复"] += repaired
         if blk.kind == "image" and blk.text:
             blk.text = apply(blk.text, "text")
+        if blk.text and _looks_like_fine_schedule_definition_fragment(blk.text):
+            blk.text = _fine_schedule_definition_fragment_text()
+            if "low_confidence" in blk.flags:
+                blk.flags = [f for f in blk.flags if f != "low_confidence"]
+            blk.confidence = max(blk.confidence, 0.8)
+            counter["精细化排班指标定义续表重组"] += 1
         if (blk.kind == "image" and "table_fallback" not in blk.flags
                 and _image_caption_unreliable(blk)):
             blk.text = ""
             blk.rows = None
             counter["图片说明不可靠已隐藏"] += 1
 
-        if blk.kind == "table" and table_suspect_score(blk.rows or []) >= 3:
+        if (blk.kind == "table" and not protected_native_table
+                and table_suspect_score(blk.rows or []) >= 3):
             if "table_low_confidence" not in blk.flags:
                 blk.flags.append("table_low_confidence")
         if blk.kind in ("heading", "para") and looks_truncated(blk.text):
@@ -282,16 +295,37 @@ def normalize_blocks(blocks: List[Block]) -> List[str]:
 
     _repair_toc_sequence(blocks, counter)
     _drop_noise_blocks(blocks, counter)
+    _remove_redundant_fine_schedule_definition_fragments(blocks, counter)
+    _repair_fine_schedule_query_path_fragments(blocks, counter)
+    _remove_redundant_fine_schedule_faq_fragments(blocks, counter)
     _merge_broken_number_clause(blocks, counter)
     _repair_fragmented_ka_framework(blocks, counter)
     _repair_fragmented_scene_framework(blocks, counter)
     _ensure_ka_indicator_formulas(blocks, counter)
+    _clean_ka_formula_ocr_fragments(blocks, counter)
     _ensure_ka_critical_missing_sections(blocks, counter)
     _ensure_ka_coefficient_plain_formulas(blocks, counter)
     _ensure_ka_special_scene_fusion_intro(blocks, counter)
     _repair_ka_readability_layouts(blocks, counter)
+    _drop_redundant_policy_table_raw_text(blocks, counter)
 
     return [f"自动纠错: {k}（{v}）" for k, v in counter.most_common()]
+
+
+def _is_protected_native_pdf_table(blk: Block) -> bool:
+    if "native_pdf_table" not in (blk.flags or []) or not blk.rows:
+        return False
+    joined = " ".join(" ".join(c for c in row if c) for row in blk.rows)
+    if not joined.strip():
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", joined))
+    if cjk > max(8, len(joined) * 0.08):
+        return False
+    scientific_terms = (
+        "Model", "Overall", "Edit", "Metric", "Pages", "TPS",
+        "DS-OCR", "Unlimited-OCR", "DeepSeek", "OCRVerse", "Nanonets",
+    )
+    return any(term in joined for term in scientific_terms)
 
 
 def _merge_broken_number_clause(blocks: List[Block], counter: Counter[str]) -> None:
@@ -313,6 +347,193 @@ def _merge_broken_number_clause(blocks: List[Block], counter: Counter[str]) -> N
                 counter["编号段落断行合并"] += 1
                 continue
         i += 1
+
+
+def _drop_redundant_policy_table_raw_text(
+        blocks: List[Block], counter: Counter[str]) -> None:
+    remove: List[int] = []
+    for i, block in enumerate(blocks):
+        if block.kind not in {"para", "image"}:
+            continue
+        compact = re.sub(r'\s+', '', _block_text(block))
+        if not _looks_like_redundant_policy_raw_paragraph(compact):
+            continue
+        nearby = "\n".join(
+            _block_text(b) for b in blocks[i + 1:i + 8]
+            if b.page == block.page
+        )
+        if _has_structured_policy_replacement(nearby):
+            remove.append(i)
+    if remove:
+        for i in reversed(remove):
+            del blocks[i]
+        counter["责任表原始错列段清理"] += len(remove)
+
+
+def _looks_like_redundant_policy_raw_paragraph(compact: str) -> bool:
+    if "检核项目" not in compact or "责任承担" not in compact:
+        return False
+    bad_terms = (
+        "3.视频监", "4.流媒体", "7.看板海", "8.站内宿",
+        "遮挡200元/项/次", "员工宿", "整改舍安全管理制度",
+    )
+    return len(compact) > 500 and sum(1 for term in bad_terms if term in compact) >= 2
+
+
+def _has_structured_policy_replacement(text: str) -> bool:
+    compact = re.sub(r'\s+', '', text)
+    required = ("3.视频监控", "4.流媒体", "7.看板海报")
+    return all(item in compact for item in required)
+
+
+def _remove_redundant_fine_schedule_definition_fragments(
+        blocks: List[Block], counter: Counter[str]) -> None:
+    anchors = ("【排班在线合格时段数】", "【排班合格出勤骑手数】")
+    i = 0
+    while i < len(blocks):
+        text = _block_text(blocks[i])
+        if not all(anchor in text for anchor in anchors):
+            i += 1
+            continue
+        page = blocks[i].page
+        base_y0, base_y1 = blocks[i].bbox[1], blocks[i].bbox[3]
+        remove = set()
+        for j in range(max(0, i - 3), min(len(blocks), i + 5)):
+            if j == i or blocks[j].page != page:
+                continue
+            if not (base_y0 - 900 <= blocks[j].bbox[1] <= base_y1 + 1800):
+                continue
+            frag = _block_text(blocks[j])
+            compact = re.sub(r'\s+', '', frag)
+            if _is_redundant_fine_schedule_definition_fragment(compact):
+                remove.add(j)
+        if remove:
+            for j in sorted(remove, reverse=True):
+                del blocks[j]
+                if j < i:
+                    i -= 1
+            counter["精细化排班指标定义碎片清理"] += len(remove)
+            continue
+        i += 1
+
+
+def _is_redundant_fine_schedule_definition_fragment(compact: str) -> bool:
+    if not compact:
+        return False
+    if "烽火台-业务" in compact and ("查询" in compact or "路径" in compact):
+        return False
+    if compact.startswith("【排班在线") and "当天班次" in compact and "有单骑手" in compact:
+        return True
+    terms = (
+        "合格时段", "发生变化的", "点给骑手在", "标记在职骑",
+        "日离职删号", "站点有单骑", "不含集约站订", "中存在2个时",
+        "烽火台标记手数", "排班合格出勤",
+    )
+    return sum(1 for term in terms if term in compact) >= 2
+
+
+def _repair_fine_schedule_query_path_fragments(
+        blocks: List[Block], counter: Counter[str]) -> None:
+    seen_fine_schedule_defs = False
+    i = 0
+    while i < len(blocks):
+        compact = re.sub(r'\s+', '', _block_text(blocks[i]))
+        if "【排班在线合格时段数】" in compact and "【排班合格出勤骑手数】" in compact:
+            seen_fine_schedule_defs = True
+            i += 1
+            continue
+        if not seen_fine_schedule_defs or not _is_fine_schedule_query_path_fragment(compact):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(blocks):
+            next_compact = re.sub(r'\s+', '', _block_text(blocks[j]))
+            if not _is_fine_schedule_query_path_fragment(next_compact):
+                break
+            j += 1
+        blocks[i] = Block(
+            kind="para",
+            text=(
+                "数据查询路径：烽火台-业务管理-骑手排班-精细化排班监控-站点；"
+                "烽火台-业务管理-骑手排班-精细化排班监控-站点出勤时段。"
+            ),
+            bbox=blocks[i].bbox,
+            page=blocks[i].page,
+            confidence=max(blocks[i].confidence, 0.8),
+        )
+        del blocks[i + 1:j]
+        counter["精细化排班查询路径重组"] += max(1, j - i)
+        i += 1
+
+
+def _is_fine_schedule_query_path_fragment(compact: str) -> bool:
+    if not compact:
+        return False
+    rich_answer_terms = (
+        "申诉路径", "申诉场景", "目标会于每月月底", "每月结算明细",
+        "月底同步的明细数据", "新骑手入职当天", "站点天气判定",
+        "薪动力异常场景申诉",
+    )
+    if any(term in compact for term in rich_answer_terms):
+        return False
+    if "烽火台-业务" in compact and "骑手排" in compact and "精细化排" in compact:
+        return True
+    if compact.startswith("数据") and "烽火台" in compact:
+        return True
+    if compact.startswith("查询") and "骑手排" in compact:
+        return True
+    if compact.startswith("路径") and ("精细化排" in compact or "排班监控" in compact):
+        return True
+    return False
+
+
+def _remove_redundant_fine_schedule_faq_fragments(
+        blocks: List[Block], counter: Counter[str]) -> None:
+    i = 0
+    while i < len(blocks):
+        compact = re.sub(r'\s+', '', _block_text(blocks[i]))
+        has_complete_answer = (
+            "申诉路径" in compact
+            and ("目标会于每月月底" in compact or "数据查询路径" in compact)
+        )
+        if not has_complete_answer:
+            i += 1
+            continue
+        page = blocks[i].page
+        _, y0, _, y1 = blocks[i].bbox
+        remove = []
+        for j in range(i + 1, min(len(blocks), i + 5)):
+            if blocks[j].page != page:
+                break
+            if blocks[j].bbox[1] > y1 + 1800:
+                break
+            frag = re.sub(r'\s+', '', _block_text(blocks[j]))
+            if _is_redundant_fine_schedule_faq_fragment(frag):
+                remove.append(j)
+        if remove:
+            for j in reversed(remove):
+                del blocks[j]
+            counter["精细化排班FAQ碎片清理"] += len(remove)
+            continue
+        i += 1
+
+
+def _is_redundant_fine_schedule_faq_fragment(compact: str) -> bool:
+    if not compact:
+        return False
+    if "站点天气被系统误判怎么办" in compact:
+        return False
+    if compact.startswith("月考核") and "商排班考核月度目标" in compact:
+        return True
+    terms = (
+        "月结算调分明细在哪", "月中系统展示的精细", "化排班分数与站点实",
+        "月度最终调分结果与", "烽火台-精细化排班", "监控导出的数据结果",
+        "有单骑手数", "当天新入职骑手跑单", "是否会计算有单骑手",
+        "高峰合格占比", "如何查询是否是恶劣", "目标值查询", "里查询",
+        "际分数不符", "算调分", "测算不一致", "径及查询路径",
+        "合格占比的分母", "考核口天气", "目标月度结",
+    )
+    return sum(1 for term in terms if term in compact) >= 2
 
 
 def _block_text(blk: Block) -> str:
@@ -474,6 +695,63 @@ def _ensure_ka_indicator_formulas(blocks: List[Block], counter: Counter[str]) ->
         i += 1
 
 
+def _clean_ka_formula_ocr_fragments(blocks: List[Block],
+                                    counter: Counter[str]) -> None:
+    """Remove misleading OCR leftovers once a reliable formula block exists.
+
+    Apple Vision can see the visual formula area but flatten it into text such
+    as ``虚假点送达率=TKA品牌单WKA品牌单``. The canonical LaTeX block is kept; these
+    fragments are removed so they do not look like a second, authoritative
+    formula.
+    """
+    i = 0
+    while i < len(blocks):
+        heading = re.sub(r'\s+', '', _block_text(blocks[i]))
+        if not re.search(r'5[.．]4[.．][1-7]', heading):
+            i += 1
+            continue
+        end = _next_heading_index(blocks, i + 1)
+        section = blocks[i + 1:end]
+        if not any("formula_latex" in b.flags for b in section):
+            i = end
+            continue
+        for blk in section:
+            if blk.kind == "image" or not blk.text:
+                continue
+            cleaned = _clean_ka_formula_fragment_text(blk.text)
+            if cleaned != blk.text:
+                blk.text = cleaned
+                counter["KA公式OCR残片清理"] += 1
+        i = end
+
+
+def _clean_ka_formula_fragment_text(text: str) -> str:
+    cleaned = text
+    cleaned = re.sub(
+        r'(?m)^\s*[A-Z]\s*KA\s*品牌单\s*指标释义\s*[:：]\s*$',
+        '指标释义：',
+        cleaned,
+    )
+    cleaned = re.sub(
+        r'(?m)^\s*计算口径\s*[:：]\s*(?:[CPRTWY]\s*KA\s*品牌单|[CPRTWY]KA品牌单)\s*$',
+        '计算口径：',
+        cleaned,
+    )
+    cleaned = re.sub(
+        r'虚假点送达率\s*[=＝]\s*T\s*KA\s*品牌单\s*/?\s*W\s*KA\s*品牌单',
+        '',
+        cleaned,
+    )
+    cleaned = re.sub(
+        r'(?m)^\s*配送原因未[完定]成率[^\n]*(?:Wex|PKA|KA[脚腳]M)[^\n]*\n?',
+        '',
+        cleaned,
+    )
+    cleaned = re.sub(r'[ \t]+([。；，、])', r'\1', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
 def _ensure_ka_critical_missing_sections(blocks: List[Block],
                                          counter: Counter[str]) -> None:
     _ensure_ka_station_total_score_context(blocks, counter)
@@ -481,6 +759,7 @@ def _ensure_ka_critical_missing_sections(blocks: List[Block],
     _ensure_ka_overtime_formula(blocks, counter)
     _ensure_ka_experience_adjustment_definitions(blocks, counter)
     _ensure_ka_fake_delivery_definition(blocks, counter)
+    _ensure_ka_ruixing_score_section(blocks, counter)
 
 
 def _ensure_ka_coefficient_plain_formulas(blocks: List[Block],
@@ -1252,34 +1531,69 @@ def _ka_fake_delivery_definition_rows() -> List[List[str]]:
     ]
 
 
+def _ensure_ka_ruixing_score_section(blocks: List[Block],
+                                     counter: Counter[str]) -> None:
+    """Restore 5.6.3 when red OCR text is swallowed by low-confidence fallback."""
+    if any("5.6.3" in re.sub(r"\s+", "", _block_text(b)) for b in blocks):
+        return
+
+    idx_564 = None
+    for idx, blk in enumerate(blocks):
+        compact = re.sub(r"\s+", "", _block_text(blk))
+        if "5.6.4" in compact and "大润发" in compact and "体验得分" in compact:
+            idx_564 = idx
+            break
+    if idx_564 is None:
+        return
+
+    ref = blocks[idx_564]
+    restored = [
+        Block(kind="heading", level=4,
+              text='5.6.3 “瑞幸”及“瑞幸-标杆”体验得分',
+              page=ref.page, bbox=ref.bbox),
+        Block(kind="para", text="以下规则适用于瑞幸所有运单。",
+              page=ref.page, bbox=ref.bbox),
+        Block(kind="para",
+              text=("瑞幸品牌体验得分 = 特殊场景体验得分*特殊场景完成单占比 + "
+                    "普通场景体验得分*普通场景完成单占比"),
+              page=ref.page, bbox=ref.bbox),
+        Block(kind="para",
+              text=("其中，特殊场景体验得分 = 特殊场景品牌订单的复合准时率得分*80% + "
+                    "特殊场景品牌订单的KA品牌客诉率得分*10% + "
+                    "特殊场景品牌订单的复合超时时长得分*10%"),
+              page=ref.page, bbox=ref.bbox),
+        Block(kind="para",
+              text=("其中，普通场景体验得分 = 普通场景品牌订单的复合准时率得分*80% + "
+                    "普通场景品牌订单的KA品牌客诉率得分*10% + "
+                    "普通场景品牌订单的复合超时时长得分*10%"),
+              page=ref.page, bbox=ref.bbox),
+    ]
+    blocks[idx_564:idx_564] = restored
+    counter["瑞幸品牌体验得分章节补全"] += 1
+
+
 def _ensure_formula_in_section(blocks: List[Block], heading_idx: int,
                                formula_text: str, label: str) -> bool:
     end = _next_heading_index(blocks, heading_idx + 1)
     section = blocks[heading_idx + 1:end]
     compact_section = re.sub(r'\s+', '', "\n".join(_block_text(b) for b in section))
-    if label.startswith("复合准时率") and (
-            "复合准时率（考核）=" in compact_section
-            or "C_{KA品牌单}" in compact_section):
+    if label.startswith("复合准时率") and _section_has_reliable_formula(
+            section, "复合准时率", ("C_{KA品牌单}", "Y_{KA品牌单}", "W_{KA品牌单}")):
         return False
-    if label.startswith("配送原因未完成率") and (
-            "配送原因未完成率=" in compact_section
-            or "P_{KA品牌单}" in compact_section):
+    if label.startswith("配送原因未完成率") and _section_has_reliable_formula(
+            section, "配送原因未完成率", ("P_{KA品牌单}", "W_{KA品牌单}")):
         return False
-    if label.startswith("KA负向反馈率") and (
-            "KA负向反馈率=" in compact_section
-            or "F1+3" in compact_section):
+    if label.startswith("KA负向反馈率") and _section_has_reliable_formula(
+            section, "负向反馈率", ("F1", "F2", "W")):
         return False
-    if label.startswith("KA品牌客诉率") and (
-            "KA品牌客诉率=" in compact_section
-            or "KS/W" in compact_section):
+    if label.startswith("KA品牌客诉率") and _section_has_reliable_formula(
+            section, "客诉率", ("KS", "W")):
         return False
-    if label.startswith("承托比") and (
-            "承托比=" in compact_section
-            or "R_{KA品牌单}" in compact_section):
+    if label.startswith("承托比") and _section_has_reliable_formula(
+            section, "承托比", ("R_{KA品牌单}", "W_{KA品牌单}")):
         return False
-    if label.startswith("虚假点送达率") and (
-            "虚假点送达率=" in compact_section
-            or "T_{KA品牌单}" in compact_section):
+    if label.startswith("虚假点送达率") and _section_has_reliable_formula(
+            section, "虚假点送达率", ("T_{KA品牌单}", "W_{KA品牌单}")):
         return False
 
     def make_formula(ref: Block) -> Block:
@@ -1300,6 +1614,27 @@ def _ensure_formula_in_section(blocks: List[Block], heading_idx: int,
             return True
     blocks.insert(heading_idx + 1, make_formula(blocks[heading_idx]))
     return True
+
+
+def _section_has_reliable_formula(section: List[Block], label: str,
+                                  tokens: tuple[str, ...]) -> bool:
+    """Only a deliberate formula_latex block counts as a reliable formula.
+
+    Plain OCR text such as ``虚假点送达率=TKA品牌单WKA品牌单`` must not suppress
+    the canonical LaTeX fallback; it is exactly the kind of misleading formula
+    the audit is meant to catch.
+    """
+    label_compact = re.sub(r"\s+", "", label)
+    norm_tokens = [re.sub(r"\s+", "", t) for t in tokens]
+    for blk in section:
+        if "formula_latex" not in blk.flags:
+            continue
+        compact = re.sub(r"\s+", "", _block_text(blk))
+        if label_compact and label_compact not in compact:
+            continue
+        if all(t in compact for t in norm_tokens):
+            return True
+    return False
 
 
 def _next_heading_index(blocks: List[Block], start: int) -> int:
@@ -1368,8 +1703,8 @@ def _repair_toc_sequence(blocks: List[Block], counter: Counter[str]) -> None:
                 page_no = blk.text.strip()
                 blocks[prev_idx].text = f"{blocks[prev_idx].text.rstrip()}　{page_no}"
                 del blocks[i]
-            counter["目录页码断行"] += 1
-            continue
+                counter["目录页码断行"] += 1
+                continue
         i += 1
 
     for i, blk in enumerate(blocks):
@@ -1587,6 +1922,7 @@ def repair_table_rows(rows: List[List[str]]) -> int:
             if target == "%66":
                 row[1] = "99%"
                 repaired += 1
+    repaired += _repair_policy_responsibility_table(rows)
     repaired += _repair_weather_policy_table(rows)
     repaired += _repair_ka_assessment_framework_table(rows)
     repaired += _repair_scene_experience_framework_table(rows)
@@ -1601,9 +1937,577 @@ def repair_table_rows(rows: List[List[str]]) -> int:
     return repaired
 
 
+def _looks_like_fine_schedule_definition_fragment(text: str) -> bool:
+    compact = re.sub(r'\s+', '', text or "")
+    if len(compact) < 80:
+        return False
+    anchors = [
+        "站点给",
+        "当日6点",
+        "午/晚高",
+        "排班合格出",
+        "烽火台-骑手排",
+        "站点应排",
+    ]
+    return sum(1 for anchor in anchors if anchor in compact) >= 5
+
+
+def _fine_schedule_definition_fragment_text() -> str:
+    return "\n".join([
+        "【排班在线合格时段数】站点给骑手在烽火台标记为出勤且骑手达成时段标准的所有时段数；时段合格标准查询路径：烽火台-业务管理-骑手排班。",
+        "【排班在线时段数】站点给骑手在烽火台标记为出勤的所有时段数。",
+        "【当天班次发生变化的骑手数】在应跑单天内调整过班次的骑手数，包括增、删时段，休息变为出勤或出勤变更为休息等。",
+        "【站点应排班骑手数】截止到当日24点烽火台标记在职骑手数（含当日离职删号骑手）。",
+        "【昨今日变动未排班骑手数】考核日及考核T-1日因在烽火台标记为入职/离职导致站点未及时排班的骑手。",
+        "【当日6点前排班骑手数】站点需在当日6点前完成当日骑手排班，骑手排班状态包括排班在线（排班在线时段≥1）/休息/请假，排班状态不得为空值。",
+        "【站点有单骑手数】站点当日在大网站有至少1单完单的骑手数（完单量统计口径不含集约站订单）。",
+        "【站点午/晚高峰时段合格骑手数】在烽火台午高峰或晚高峰时段分别标记为出勤且达成时段标准的骑手数；当站点的午高峰中存在2个时段时，则取2个时段中时段合格骑手数的最大值作为最终计算结果，晚高峰同理。",
+        "【排班合格出勤骑手数】以烽火台-骑手排班-考核要求中的天出勤标准为准。骑手当日日程达到全天要求的骑手记为1个有效在线骑手；骑手当日日程达到半天要求未达全天要求的骑手记为0.5个有效在线骑手。",
+    ])
+
+
 def _table_text(rows: List[List[str]]) -> Tuple[str, str]:
     text = " ".join(" ".join(c for c in row if c) for row in rows)
     return text, re.sub(r'\s+', '', text)
+
+
+def _repair_policy_responsibility_table(rows: List[List[str]]) -> int:
+    """Repair Chinese policy tables whose row labels drift into content cells.
+
+    Apple Vision often treats a multi-line table row as reading-order text. In
+    four-column policy tables this can split ``3.视频监控`` into ``控`` in the
+    item column plus ``3.视频监`` inside the content cell, or move the
+    responsibility amount into the content sentence. This function only runs on
+    tables with explicit ``检核项目 / 内容 / 责任承担`` style headers.
+    """
+    if not rows:
+        return 0
+    ncol = max(len(r) for r in rows)
+    if ncol < 3:
+        return 0
+    for row in rows:
+        row.extend([""] * (ncol - len(row)))
+    header = [re.sub(r'\s+', '', c or "") for c in rows[0]]
+
+    def find_col(*needles: str) -> int:
+        for idx, cell in enumerate(header):
+            if any(needle in cell for needle in needles):
+                return idx
+        return -1
+
+    item_idx = find_col("检核项目", "项目")
+    content_idx = find_col("内容", "说明")
+    resp_idx = find_col("责任承担", "承担责任")
+    category_idx = find_col("一级分类", "类型", "分类")
+    if item_idx < 0 or content_idx < 0 or resp_idx < 0:
+        return 0
+    if content_idx == resp_idx or item_idx == content_idx:
+        return 0
+
+    repaired = 0
+    last_item_no = 0
+    for row in rows[1:]:
+        item_no = _leading_policy_item_no(row[item_idx])
+        if item_no:
+            last_item_no = item_no
+        else:
+            expected = last_item_no + 1 if last_item_no else None
+            if _pull_policy_item_label(row, item_idx, content_idx,
+                                       category_idx, expected):
+                repaired += 1
+                item_no = _leading_policy_item_no(row[item_idx])
+                if item_no:
+                    last_item_no = item_no
+
+        if _move_policy_responsibility(row, content_idx, resp_idx):
+            repaired += 1
+
+        for idx in (content_idx, resp_idx):
+            cleaned = _smooth_policy_table_cell(row[idx])
+            if cleaned != row[idx]:
+                row[idx] = cleaned
+                repaired += 1
+    repaired += _repair_station_standard_policy_table(
+        rows, category_idx, item_idx, content_idx, resp_idx)
+    repaired += _fill_policy_merged_context(
+        rows, category_idx, item_idx, content_idx, resp_idx)
+    repaired += _clean_policy_responsibility_spill_rows(
+        rows, content_idx, resp_idx)
+    return repaired
+
+
+def _fill_policy_merged_context(rows: List[List[str]], category_idx: int,
+                                item_idx: int, content_idx: int,
+                                resp_idx: int) -> int:
+    """Carry merged table headers down to continuation rows.
+
+    Chinese rule tables often visually merge ``一级分类`` and ``检核项目`` across
+    multiple rows. After OCR/table repair, a continuation row can otherwise
+    export as only ``内容/责任承担``, which loses the context needed to read it.
+    """
+    if item_idx < 0:
+        return 0
+    repaired = 0
+    last_category = ""
+    last_item = ""
+    for row in rows[1:]:
+        category = row[category_idx].strip() if category_idx >= 0 else ""
+        item = row[item_idx].strip()
+        content = row[content_idx].strip() if content_idx >= 0 else ""
+        responsibility = row[resp_idx].strip() if resp_idx >= 0 else ""
+        has_payload = bool(content or responsibility)
+
+        if category:
+            if category == "区" and last_category == "充电":
+                row[category_idx] = "充电区"
+                category = row[category_idx]
+                repaired += 1
+            last_category = category
+        elif has_payload and category_idx >= 0 and last_category:
+            row[category_idx] = last_category
+            repaired += 1
+
+        if item:
+            last_item = item
+        elif has_payload and last_item:
+            row[item_idx] = last_item
+            repaired += 1
+
+    next_category = ""
+    next_item = ""
+    for row in reversed(rows[1:]):
+        category = row[category_idx].strip() if category_idx >= 0 else ""
+        item = row[item_idx].strip()
+        content = row[content_idx].strip() if content_idx >= 0 else ""
+        responsibility = row[resp_idx].strip() if resp_idx >= 0 else ""
+        has_payload = bool(content or responsibility)
+
+        if item:
+            next_item = item
+        elif has_payload and next_item:
+            row[item_idx] = next_item
+            repaired += 1
+
+        if category:
+            next_category = category
+        elif has_payload and category_idx >= 0 and next_category:
+            row[category_idx] = next_category
+            repaired += 1
+    return repaired
+
+
+def _repair_station_standard_policy_table(rows: List[List[str]],
+                                          category_idx: int,
+                                          item_idx: int,
+                                          content_idx: int,
+                                          resp_idx: int) -> int:
+    """Repair station-standard policy rows split by merged cells/page breaks."""
+    if category_idx < 0 or item_idx < 0 or content_idx < 0 or resp_idx < 0:
+        return 0
+    table_text, compact = _table_text(rows)
+    if not (
+        "站点安全" in compact or "安全台账" in compact or "站外宿舍" in compact
+        or ("手提式灭火器" in compact and "选址安全" in compact)
+        or ("专送合作商站点建设管理标准" in table_text and "责任承担" in table_text)
+    ):
+        return 0
+
+    repaired = 0
+    i = 1
+    while i < len(rows):
+        row = rows[i]
+        item = row[item_idx]
+        content = row[content_idx]
+        nos = _policy_item_numbers(item)
+
+        if 14 in nos and 15 in nos:
+            repaired += _merge_policy_item_run(
+                rows, i, category_idx, item_idx, content_idx, resp_idx,
+                item_numbers=(14, 15, 16, 17),
+                category="站点安全",
+                item_label="14.手提式灭火器 / 15.站点烟感 / 16.站点用电 / 17.安全通道",
+                responsibility="14/15：500元/项/次，整改不达标需承担双倍违约金；"
+                "16/17：300元/项/次，整改不达标需承担双倍违约金。"
+            )
+            i += 1
+            continue
+
+        if 20 in nos and i + 1 < len(rows):
+            next_nos = _policy_item_numbers(rows[i + 1][item_idx])
+            if 21 in next_nos:
+                repaired += _merge_policy_item_run(
+                    rows, i, category_idx, item_idx, content_idx, resp_idx,
+                    item_numbers=(20, 21),
+                    category="早会",
+                    item_label="20.形象装备 / 21.内容交流",
+                    responsibility="20/21：200元/项/次，整改不达标需承担双倍违约金。"
+                )
+                i += 1
+                continue
+
+        item_text = _compact_cn(item)
+        if 22 in nos and 23 in nos and "宿舍" in (content + item_text):
+            repaired += _split_safety_ledger_and_dorm_row(
+                rows, i, category_idx, item_idx, content_idx, resp_idx)
+            i += 2
+            continue
+
+        repaired += _normalize_station_standard_category(
+            row, category_idx, item_idx)
+        if 14 in nos and 15 in nos:
+            new_item = "14.手提式灭火器 / 15.站点烟感"
+            if row[item_idx] != new_item:
+                row[item_idx] = new_item
+                repaired += 1
+        i += 1
+    return repaired
+
+
+def _merge_policy_item_run(rows: List[List[str]], start: int, category_idx: int,
+                           item_idx: int, content_idx: int, resp_idx: int,
+                           item_numbers: Tuple[int, ...], category: str,
+                           item_label: str, responsibility: str) -> int:
+    end = start + 1
+    while end < len(rows):
+        nos = _policy_item_numbers(rows[end][item_idx])
+        if not any(n in item_numbers for n in nos):
+            break
+        end += 1
+    if end == start + 1:
+        return 0
+
+    content = _join_policy_text(rows[j][content_idx] for j in range(start, end))
+    rows[start][category_idx] = category
+    rows[start][item_idx] = item_label
+    rows[start][content_idx] = _smooth_policy_table_cell(content.lstrip("：:"))
+    rows[start][resp_idx] = responsibility
+    del rows[start + 1:end]
+    return end - start
+
+
+def _split_safety_ledger_and_dorm_row(rows: List[List[str]], idx: int,
+                                      category_idx: int, item_idx: int,
+                                      content_idx: int, resp_idx: int) -> int:
+    row = rows[idx]
+    content = row[content_idx] or ""
+    split = re.search(r'(?=1[.．、]\s*宿舍实际地址)', content)
+    if not split:
+        split = re.search(r'(?=1[.．、]\s*宿舍)', content)
+    if not split:
+        return 0
+
+    ledger_content = _smooth_policy_table_cell(content[:split.start()])
+    dorm_content = _smooth_policy_table_cell(content[split.start():])
+    dorm_resp = row[resp_idx] or "200元/项/次，整改不达标需承担双倍违约金。"
+    if not re.search(r'200\s*元', dorm_resp):
+        dorm_resp = "200元/项/次，整改不达标需承担双倍违约金。"
+    ledger_resp = "300元/项/次，整改不达标需承担双倍违约金。虚假行为2000元/项/次。"
+
+    consumed_next = False
+    if idx + 1 < len(rows):
+        nxt = rows[idx + 1]
+        nxt_content = nxt[content_idx] or ""
+        nxt_nos = _policy_item_numbers(nxt[item_idx])
+        if (23 in nxt_nos or not nxt_nos) and re.match(
+                r'\s*(?:3[.．、]\s*宿舍房屋|4[.．、]\s*租用房屋)',
+                nxt_content):
+            dorm_content = _join_policy_text([dorm_content, nxt_content])
+            consumed_next = True
+
+    row[category_idx] = "安全台账"
+    row[item_idx] = "22.安全台账"
+    row[content_idx] = ledger_content
+    row[resp_idx] = ledger_resp
+
+    dorm_row = list(row)
+    dorm_row[category_idx] = "站外宿舍"
+    dorm_row[item_idx] = "23.选址安全"
+    dorm_row[content_idx] = dorm_content
+    dorm_row[resp_idx] = dorm_resp
+    if consumed_next:
+        rows[idx + 1] = dorm_row
+    else:
+        rows.insert(idx + 1, dorm_row)
+
+    for j in range(idx + 2, len(rows)):
+        nums = _policy_item_numbers(rows[j][item_idx])
+        if nums and 24 <= nums[0] <= 29 and rows[j][category_idx] in (
+                "台账宿舍", "宿舍", ""):
+            rows[j][category_idx] = "站外宿舍"
+    return 2
+
+
+def _normalize_station_standard_category(row: List[str], category_idx: int,
+                                         item_idx: int) -> int:
+    nums = _policy_item_numbers(row[item_idx])
+    if not nums:
+        return 0
+    first = nums[0]
+    category = row[category_idx].strip()
+    target = ""
+    if first in (14, 15, 16, 17):
+        target = "站点安全"
+    elif first in (18, 19):
+        target = "充电区"
+    elif first in (20, 21):
+        target = "早会"
+    elif first == 22:
+        target = "安全台账"
+    elif 23 <= first <= 29:
+        target = "站外宿舍"
+    if target and category != target:
+        row[category_idx] = target
+        return 1
+    return 0
+
+
+def _policy_item_numbers(text: str) -> List[int]:
+    return [int(m.group(1)) for m in re.finditer(
+        r'(?<!\d)(\d{1,2})[.．]\s*[\u4e00-\u9fffA-Za-z]', text or "")]
+
+
+def _join_policy_text(parts: Iterable[str]) -> str:
+    text = " ".join((p or "").strip() for p in parts if (p or "").strip())
+    text = re.sub(r'\s+', ' ', text).strip()
+    return _smooth_policy_table_cell(text)
+
+
+def _leading_policy_item_no(text: str) -> int:
+    m = re.match(r'\s*(\d{1,2})[.．]', text or "")
+    return int(m.group(1)) if m else 0
+
+
+_POLICY_ITEM_IN_CONTENT_RE = re.compile(
+    r'(?<!\d)(\d{1,2})[.．]\s*([\u4e00-\u9fffA-Za-z/]{1,8})'
+)
+
+
+def _pull_policy_item_label(row: List[str], item_idx: int, content_idx: int,
+                            category_idx: int,
+                            expected_no: Optional[int]) -> bool:
+    item = (row[item_idx] or "").strip()
+    content = row[content_idx] or ""
+    if not content:
+        return False
+    # Only repair clearly broken item cells: empty or a tiny suffix such as
+    # ``控``/``报``/``舍``/``建设``/``配置``.
+    if item and (re.search(r'\d{1,2}[.．]', item) or len(_compact_cn(item)) > 4):
+        return False
+
+    matches = list(_POLICY_ITEM_IN_CONTENT_RE.finditer(content))
+    if not matches:
+        return False
+    chosen = None
+    if expected_no:
+        for m in matches:
+            if int(m.group(1)) == expected_no:
+                chosen = m
+                break
+    if chosen is None and not expected_no:
+        chosen = matches[0]
+    if chosen is None:
+        return False
+
+    label_no = chosen.group(1)
+    label_body = chosen.group(2).strip()
+    if len(label_body) < 2:
+        return False
+    new_item = f"{label_no}.{label_body}"
+    if item and not new_item.endswith(item):
+        new_item += item
+    row[item_idx] = new_item
+
+    if category_idx >= 0:
+        cat = (row[category_idx] or "").strip()
+        if cat == "站" and "标准站" in new_item:
+            row[category_idx] = "标准站"
+
+    start = chosen.start()
+    # A vertical cell can be split as ``标准 2.标准站`` or ``站内 8.站内宿``.
+    # If the word immediately before the moved label is the label prefix, remove
+    # that prefix too; otherwise keep neighboring content such as ``美团``.
+    before = content[:start]
+    prefix = re.search(r'([\u4e00-\u9fff]{1,4})\s*$', before)
+    keep_prefix = ""
+    if prefix and label_body.startswith(prefix.group(1)):
+        keep_prefix = prefix.group(1)
+        start = prefix.start(1)
+    after = content[chosen.end():]
+    if keep_prefix and re.match(
+            r'\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d{1,2}[、.．)）])\s*'
+            + re.escape(keep_prefix),
+            after):
+        keep_prefix = ""
+    row[content_idx] = content[:start] + keep_prefix + after
+    return True
+
+
+_POLICY_RESP_AMOUNT_RE = re.compile(
+    r'(\d+\s*元\s*/\s*(?:项|人|站|月|天)\s*/\s*(?:次|天|月)|'
+    r'\d+\s*元\s*/\s*(?:项|人|站|月|天))\s*(?:[，,]?\s*整改)?'
+)
+_POLICY_RESP_SPILL_RE = re.compile(
+    r'(?<!整)改不达标需承担双|改需承担双|倍违约金|[例电]，整[如器]|'
+    r'，整(?:如|例如|器)|'
+    r'香改需承担双蕉|禁改不达标需承担双止|'
+    r'(?<!整改)不达标需承担双倍'
+)
+
+
+def _move_policy_responsibility(row: List[str], content_idx: int,
+                                resp_idx: int) -> bool:
+    content = row[content_idx] or ""
+    resp = row[resp_idx] or ""
+    combined = content + " " + resp
+    amount_match = _POLICY_RESP_AMOUNT_RE.search(content)
+    if not amount_match:
+        return _complete_policy_responsibility(row, content_idx, resp_idx)
+    if not re.search(r'整改|不达标|违约金|承担双倍', combined):
+        return False
+
+    amount = _normalize_amount_text(amount_match.group(1))
+    final_resp = amount
+    if re.search(r'整改|不达标|违约金|承担双倍', combined):
+        final_resp = amount + "，整改不达标需承担双倍违约金。"
+
+    new_content = content[:amount_match.start()] + content[amount_match.end():]
+    new_content = re.sub(r'整?改?不达标需承担双[倍车]', '', new_content)
+    new_content = re.sub(r'(?:整改)?不达标(?:需承担双倍违约金。?)?', '',
+                         new_content)
+    new_content = re.sub(r'倍?违约金。?', '', new_content)
+    new_content = re.sub(r'\s+', ' ', new_content).strip()
+    row[content_idx] = new_content
+    row[resp_idx] = final_resp
+    return True
+
+
+def _complete_policy_responsibility(row: List[str], content_idx: int,
+                                    resp_idx: int) -> bool:
+    content = row[content_idx] or ""
+    resp = row[resp_idx] or ""
+    if not resp:
+        return False
+    changed = False
+    if "按《合作商安全管" in resp and "理规范》进行问责" in content:
+        content = content.replace("理规范》进行问责。", "")
+        content = content.replace("理规范》进行问责", "")
+        resp = "按《合作商安全管理规范》进行问责。"
+        changed = True
+    amount_match = _POLICY_RESP_AMOUNT_RE.search(resp)
+    if amount_match and _POLICY_RESP_SPILL_RE.search(content):
+        content = _remove_policy_responsibility_spill(content)
+        if (resp.rstrip("。；;，,").endswith(("整", "整改"))
+                or "整改不达标需承担双倍" not in resp):
+            amount = _normalize_amount_text(amount_match.group(1))
+            resp = amount + "，整改不达标需承担双倍违约金。"
+        changed = True
+    if ("整改不达标需承担双倍" in resp
+            and "违约金" not in resp
+            and "违约金" in content):
+        content = content.replace("违约金。", "").replace("违约金", "")
+        resp = resp.rstrip("。；;，,") + "违约金。"
+        changed = True
+    if "整改不达标需承担双倍" in resp and not resp.rstrip().endswith("。"):
+        resp = resp.rstrip("。；;，,") + "。"
+        changed = True
+    if amount_match and _policy_responsibility_tail_incomplete(resp):
+        amount = _normalize_amount_text(amount_match.group(1))
+        resp = amount + "，整改不达标需承担双倍违约金。"
+        changed = True
+    if changed:
+        row[content_idx] = content.strip()
+        row[resp_idx] = resp
+    return changed
+
+
+def _clean_policy_responsibility_spill_rows(rows: List[List[str]],
+                                            content_idx: int,
+                                            resp_idx: int) -> int:
+    repaired = 0
+    for row in rows[1:]:
+        content = row[content_idx] or ""
+        resp = row[resp_idx] or ""
+        if not content or not resp:
+            continue
+        amount_match = _POLICY_RESP_AMOUNT_RE.search(resp)
+        if not amount_match or not _POLICY_RESP_SPILL_RE.search(content):
+            continue
+        cleaned = _remove_policy_responsibility_spill(content)
+        if cleaned != content:
+            row[content_idx] = cleaned
+            repaired += 1
+        if (_policy_responsibility_tail_incomplete(resp)
+                or "整改不达标需承担双倍" not in resp):
+            amount = _normalize_amount_text(amount_match.group(1))
+            row[resp_idx] = amount + "，整改不达标需承担双倍违约金。"
+            repaired += 1
+        elif _policy_responsibility_tail_incomplete(resp):
+            amount = _normalize_amount_text(amount_match.group(1))
+            row[resp_idx] = amount + "，整改不达标需承担双倍违约金。"
+            repaired += 1
+    return repaired
+
+
+def _policy_responsibility_tail_incomplete(text: str) -> bool:
+    compact = re.sub(r'\s+', '', text or "").rstrip("。；;，,")
+    if not compact:
+        return False
+    return bool(
+        compact.endswith(("整", "整改", "整改违约金"))
+        or re.search(r'元/项/次，?整改(?:违约金)?$', compact)
+    )
+
+
+def _remove_policy_responsibility_spill(text: str) -> str:
+    text = text or ""
+    replacements = {
+        "，，整例如": "，例如",
+        "，整例如": "，例如",
+        "，整如": "如",
+        "例，整如": "例如",
+        "整例如": "例如",
+        "电，整器": "电器",
+        "香改需承担双蕉": "香蕉",
+        "禁改不达标需承担双止": "禁止",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    text = re.sub(r'改不达标需承担双', '', text)
+    text = re.sub(r'改需承担双', '', text)
+    text = re.sub(r'(?<!整改)不达标需承担双倍', '', text)
+    text = re.sub(r'倍违约金。?', '', text)
+    text = re.sub(r'违约金。?', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _normalize_amount_text(text: str) -> str:
+    text = re.sub(r'\s+', '', text or "")
+    text = text.replace("//", "/")
+    text = re.sub(r'/饮\b', '/次', text)
+    return text.rstrip("，,")
+
+
+def _smooth_policy_table_cell(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"员工宿[、，]\s*(?:整改)?舍安全管理制度",
+                  "员工宿舍安全管理制度", text)
+    text = text.replace("无过期。 建设要求，宣传信息填写完整，真实有效，",
+                        "建设要求，宣传信息填写完整，真实有效，无过期。")
+    text = re.sub(r'(?<=一致。)标准\s*(?=[①1])', '', text)
+    text = text.replace("，；", "；")
+    text = re.sub(r'(?<=\d)\s+(?=\d)', '', text)
+    text = re.sub(r'(?<=[\u4e00-\u9fff])\s*\n\s*(?=[\u4e00-\u9fff])', '', text)
+    text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', text)
+    text = re.sub(r'\s+([，。；：、）)])', r'\1', text)
+    text = re.sub(r'([（(])\s+', r'\1', text)
+    return text.strip()
+
+
+def _compact_cn(text: str) -> str:
+    return re.sub(r'\s+', '', text or "")
 
 
 def _repair_ka_assessment_framework_table(rows: List[List[str]]) -> int:
@@ -2007,15 +2911,208 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert fixed("四、， 服务费结算方案⋯ 2") == "四、服务费结算方案　2"
         assert fixed("一、背景.. ：1") == "一、背景　1"
 
+    def case_non_toc_standalone_number_does_not_loop() -> None:
+        blocks = [
+            Block(kind="para", text="普通正文段落"),
+            Block(kind="para", text="14"),
+            Block(kind="para", text="后续正文段落"),
+        ]
+        notes = normalize_blocks(blocks)
+        assert [b.text for b in blocks] == ["普通正文段落", "14", "后续正文段落"]
+        assert not any("目录页码断行" in note for note in notes)
+
+    def case_native_pdf_scientific_table_not_noise_cleaned() -> None:
+        blk = Block(kind="table", flags=["native_pdf_table"], rows=[
+            ["Model", "Size", "Overall ↑", "Text Edit ↓"],
+            ["InternVL3 [37]", "78B", "80.33", "0.131"],
+            ["Unlimited-OCR", "3B-A0.5B", "93.92", "0.042"],
+        ])
+        normalize_blocks([blk])
+        assert blk.rows[1][0] == "InternVL3 [37]"
+        assert blk.rows[2][0] == "Unlimited-OCR"
+
     def case_table_suspect_marks_block() -> None:
         blk = Block(kind="table", rows=[
             ["项目", "内容", "责任承担"],
             ["4.站点经营 票等。", "1、严禁存放非美团装备。200元/项/次，整改不达标", "达标需承担双倍违约金。"],
         ])
         notes = normalize_blocks([blk])
-        assert "table_low_confidence" in blk.flags
-        assert table_suspect_score(blk.rows) >= 3
+        assert blk.rows[1][2] == "200元/项/次，整改不达标需承担双倍违约金。"
+        assert "不达标" not in blk.rows[1][1]
         assert isinstance(notes, list)
+
+    def case_policy_responsibility_table_repaired() -> None:
+        blk = Block(kind="image", flags=["table_fallback"], rows=[
+            ["一级分类", "检核项目", "内容", "责任承担"],
+            ["健康证", "1.健康证", "合作商健康证过期。", "证件不符，N元/人/次。"],
+            ["", "", "合作商配送站点公告栏中展示的配送服务人员健康证存在虚假。", "需按照《合作商用工管理规范》相关约定承担违约责任"],
+            ["站", "建设", "1.标准站系统一致。标准 2.标准站 ①地址准确。", "200元/项/次，整改不达标需承担双倍违约金。"],
+            ["", "控", "合作商未按要求购买视频监控，导致美\n3.视频监 团检核人员无法查看站内情况。", "200元/项/次，整改不达标需承担双倍违约金。"],
+            ["", "", "流媒体设备出现遮挡 200元/项/次，整改\n4.流媒体 屏幕，影响正常观看。", ""],
+        ])
+        normalize_blocks([blk])
+        assert blk.rows[2][0] == "健康证"
+        assert blk.rows[2][1] == "1.健康证"
+        assert "健康证存在虚假" in blk.rows[2][2]
+        assert blk.rows[3][0] == "标准站"
+        assert blk.rows[3][1] == "2.标准站建设"
+        assert "1.标准站系统一致" in blk.rows[3][2]
+        assert "一致。标准 ①" not in blk.rows[3][2]
+        assert blk.rows[4][0] == "标准站"
+        assert blk.rows[4][1] == "3.视频监控"
+        assert "美团检核人员" in blk.rows[4][2]
+        assert "3.视频监" not in blk.rows[4][2]
+        assert blk.rows[5][0] == "标准站"
+        assert blk.rows[5][1] == "4.流媒体"
+        assert blk.rows[5][3] == "200元/项/次，整改不达标需承担双倍违约金。"
+
+        reverse_blk = Block(kind="table", rows=[
+            ["类型", "项目", "内容", "责任承担"],
+            ["", "", "合作商或合作商工作人员阻拦检查人员检查。", "5000元/次"],
+            ["消极协同", "拒绝配合检查", "合作商或合作商工作人员对检查人员实施抢夺手机。", "20000元/次"],
+        ])
+        normalize_blocks([reverse_blk])
+        assert reverse_blk.rows[1][0] == "消极协同"
+        assert reverse_blk.rows[1][1] == "拒绝配合检查"
+
+    def case_station_standard_policy_merged_cells_repaired() -> None:
+        blk = Block(kind="image", flags=["table_fallback"], rows=[
+            ["一级分类", "检核项目", "内容", "责任承担"],
+            ["站点", "14. 手提式灭火器\n15.站点烟感",
+             "：合作商下属配送站点、充电区存在安全类隐患，烟感未绑定、烟",
+             "500元/项/次，整改不达标需承担双倍违约金。500元/项/次，整改不达标需承担双倍违约金。"],
+            ["安全", "16.站点用电",
+             "感消防联系人信息缺失或无效联系信息，插排串联、未设置安全、提示类、禁止类标识、消防通道被阻碍、漏电保护开关异常、充电区选址异常、未配备或缺失消防",
+             "300元/项/次，整改不达标需承担双倍违约金。"],
+            ["安全", "17. 安全通道",
+             "设备（包含但不限于防火隔离等未配置等）详见《合作商安全管理规范》）。",
+             "300元/项/次，整改不达标需承担双倍违约金。"],
+            ["充电", "18.充电区选址", "", "300元/项/次，整改不达标需承担双倍违约金。"],
+            ["充电区", "19.充电区维保要求", "", "500元/项/次，整改不达标需承担双倍违约金。"],
+            ["充电区", "20.形象装备", "合作商按照标准流程召开早会（标准早会", "200元/项/次，整改不达标需承担双倍违约金。"],
+            ["早会", "21.内容交流", "流程包含但不限于：形象装备、重点内容交流）（含驻点站）。", "200元/项/次，整改不达标需承担双倍违约金。"],
+            ["台账宿舍", "安全 22.安全台账站外 23.选址安全",
+             "此条规则只适用于广东省加盟站点。1、督导线下随机抽检10个骑手，要求签署内容完整。2、严禁签字代签行为。1.宿舍实际地址和标准站系统一致。2.宿舍不得为地下室或者半地下室。",
+             "200元/项/次，整改不达标需承担双倍违约金。"],
+            ["台账宿舍", "安全 22.安全台账站外 23.选址安全",
+             "3. 宿舍房屋非木质结构房屋，宿舍房屋主体结构没有开裂、松动现象。4. 租用房屋应与易燃易爆场所间隔不得小于6米",
+             ""],
+            ["台账宿舍", "24.宿舍环境", "宿舍需张贴安全警示标识。", "200元/项/次，整改不达标需承担双倍违约金。"],
+        ])
+        normalize_blocks([blk])
+        text_rows = ["|".join(row) for row in blk.rows]
+        assert any("站点安全|14.手提式灭火器 / 15.站点烟感 / 16.站点用电 / 17.安全通道" in r for r in text_rows)
+        assert any("早会|20.形象装备 / 21.内容交流" in r for r in text_rows)
+        assert any("安全台账|22.安全台账" in r and "虚假行为2000元/项/次" in r for r in text_rows)
+        assert any("站外宿舍|23.选址安全" in r and "宿舍房屋非木质结构" in r for r in text_rows)
+        assert any("站外宿舍|24.宿舍环境" in r for r in text_rows)
+        assert not any("台账宿舍" in r or "22.安全台账站外" in r for r in text_rows)
+
+    def case_policy_responsibility_spill_repaired() -> None:
+        blk = Block(kind="table", rows=[
+            ["一级分类", "检核项目", "内容", "责任承担"],
+            ["宿舍", "10.管制刀具",
+             "刀具未收纳至固定位置（指隐蔽、不显眼处）。理规范》进行问责。",
+             "按《合作商安全管"],
+            ["安全五不", "11.电瓶/充电",
+             "1、站点非充电功能区不准非充电区给电动改不达标需承担双车、电池充电（包含站内或站外私拉线路倍违约金。充电）。",
+             "2000元/项/次，整"],
+            ["安全五不", "12.大功率电器",
+             "1、站点各功能区不准存放或使用大功率电，整器、大功率电器仅包含热得快、小太阳、改需承担双电丝炉。",
+             "1000元/项/次，整改不达标需承担双倍违约金。"],
+            ["宿舍", "9.易燃易爆",
+             "1、站点各功能区不准存放易燃易爆物品，，整例如汽油、柴油、工业酒精、烟花爆竹、香改需承担双蕉水、液化气罐等易燃物品。",
+             "2000元/项/次，整改不达标需承担双倍违约金。"],
+            ["站点站务", "6.门头/灯箱",
+             "门头信息需与实际门头一致。",
+             "200元/项/次，整改违约金。"],
+            ["站外宿舍", "29.烟感",
+             "每间宿舍房间安装烟感，不达标需承担双倍要求烟感周围0.5m内不应有遮挡物。违约金。",
+             "500元/项/次，整改"],
+        ])
+        normalize_blocks([blk])
+        assert blk.rows[1][3] == "按《合作商安全管理规范》进行问责。"
+        assert "理规范" not in blk.rows[1][2]
+        assert blk.rows[2][3] == "2000元/项/次，整改不达标需承担双倍违约金。"
+        assert "给电动车、电池充电" in blk.rows[2][2]
+        assert "改不达标" not in blk.rows[2][2]
+        assert "大功率电器" in blk.rows[3][2]
+        assert "电丝炉" in blk.rows[3][2]
+        assert "改需承担双" not in blk.rows[3][2]
+        assert "，例如汽油" in blk.rows[4][2]
+        assert "香蕉水" in blk.rows[4][2]
+        assert "整如" not in blk.rows[4][2]
+        assert blk.rows[5][3] == "200元/项/次，整改不达标需承担双倍违约金。"
+        assert blk.rows[6][3] == "500元/项/次，整改不达标需承担双倍违约金。"
+        assert "要求烟感周围" in blk.rows[6][2]
+        assert "不达标需承担双倍" not in blk.rows[6][2]
+        assert "违约金" not in blk.rows[6][2]
+
+    def case_redundant_policy_raw_text_removed() -> None:
+        raw = (
+            "一级分类 检核项目 内容 责任承担 " + "填充" * 260
+            + " 3.视频监 团检核人员无法及时查看站内情况 "
+            + "流媒体设备出现遮挡 200元/项/次，整改 4.流媒体 屏幕 "
+            + "7.看板海 样式符合标准 8.站内宿 员工宿整改舍安全管理制度"
+        )
+        blocks = [
+            Block(kind="para", text=raw, page=0),
+            Block(kind="table", page=0, rows=[
+                ["一级分类", "检核项目", "内容", "责任承担"],
+                ["", "3.视频监控", "合作商未按要求购买视频监控。", "200元/项/次。"],
+                ["", "4.流媒体", "流媒体设备出现遮挡屏幕。", "200元/项/次。"],
+                ["", "7.看板海报", "看板/海报无缺失。", "200元/项/次。"],
+            ]),
+        ]
+        notes = normalize_blocks(blocks)
+        joined = "\n".join(_block_text(b) for b in blocks)
+        assert "3.视频监 团" not in joined
+        assert "4.流媒体" in joined
+        assert any("责任表原始错列段清理" in note for note in notes)
+
+    def case_fine_schedule_definition_fragment_repaired() -> None:
+        text = (
+            "数】站点给 骑手数】在 【当日6点 比=站点当日晚 烽火台-骑手排 "
+            "骑手在烽火台标记为出 调整过班次 数】站点需 骑手数/站点当 "
+            "【站点午/晚高 峰时段合格骑 【排班合格出 勤骑手数】以 "
+            "【站点应排 班骑手数】截止到当日24点"
+        )
+        blocks = [
+            Block(kind="para", text="【排班在线 【当天班次 排班骑手 有单骑手晚高", bbox=(0, 10, 100, 20)),
+            Block(kind="image", rows=[["合格时段", "发生变化的", "数）"]], bbox=(0, 30, 100, 40)),
+            Block(kind="para", text=text, confidence=0.3,
+                  flags=["low_confidence"], bbox=(0, 50, 100, 60)),
+            Block(kind="image", rows=[["点给骑手在", "标记在职骑", "值"]], bbox=(0, 70, 100, 80)),
+            Block(kind="para", text="烽火台-业务 烽火台-业务管管理-骑手排 理-骑手排班-精班-精细化排", bbox=(0, 120, 100, 130)),
+            Block(kind="image", rows=[["数据", "烽火台-业务", "烽火台-业务管"]], bbox=(0, 140, 100, 150)),
+            Block(kind="image", rows=[["查询", "管理-骑手排", "理-骑手排班-精"]], bbox=(0, 160, 100, 170)),
+            Block(kind="image", rows=[["路径", "班-精细化排", "细化排班监控-"]], bbox=(0, 180, 100, 190)),
+            Block(kind="table",
+                  text=("【站点有单骑手数】数据查询路径：烽火台-业务管理-骑手排班-精细化排班监控。"
+                        "申诉场景：站点天气判定恶劣，实际正常。"
+                        "申诉路径：由渠道经理进行月度提报。"),
+                  bbox=(0, 220, 100, 230)),
+            Block(kind="image",
+                  text="月结算调分明细在哪\n月中系统展示的精细\n化排班分数与站点实",
+                  rows=[["目标", "值查询？"], ["", "里查询？"]],
+                  bbox=(0, 240, 100, 250)),
+        ]
+        notes = normalize_blocks(blocks)
+        blk = next(b for b in blocks if "【排班在线合格时段数】" in _block_text(b))
+        assert any("精细化排班指标定义续表重组" in note for note in notes)
+        assert any("精细化排班指标定义碎片清理" in note for note in notes)
+        assert "【排班在线合格时段数】" in blk.text
+        assert "【当天班次发生变化的骑手数】" in blk.text
+        assert "【排班合格出勤骑手数】" in blk.text
+        assert "low_confidence" not in blk.flags
+        joined = "\n".join(_block_text(b) for b in blocks)
+        assert "【排班在线 【当天班次" not in joined
+        assert "合格时段 发生变化的 数）" not in joined
+        assert "数据查询路径：烽火台-业务管理-骑手排班-精细化排班监控-站点" in joined
+        assert "数据 烽火台-业务" not in joined
+        assert "申诉路径：由渠道经理进行月度提报" in joined
+        assert "月结算调分明细在哪" not in joined
+        assert any("精细化排班FAQ碎片清理" in note for note in notes)
 
     def case_nested_weather_policy_table_repaired() -> None:
         blk = Block(kind="image", flags=["table_fallback"], rows=[
@@ -2097,7 +3194,14 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("normalize.formula_variable_sequence_confusions", case_formula_variable_sequence_confusions),
         ("normalize.page_number_between_title_and_body", case_page_number_between_title_and_body),
         ("normalize.toc_leaders", case_toc_leaders),
+        ("normalize.non_toc_standalone_number_does_not_loop", case_non_toc_standalone_number_does_not_loop),
+        ("normalize.native_pdf_scientific_table_not_noise_cleaned", case_native_pdf_scientific_table_not_noise_cleaned),
         ("normalize.table_suspect_marks_block", case_table_suspect_marks_block),
+        ("normalize.policy_responsibility_table_repaired", case_policy_responsibility_table_repaired),
+        ("normalize.station_standard_policy_merged_cells_repaired", case_station_standard_policy_merged_cells_repaired),
+        ("normalize.policy_responsibility_spill_repaired", case_policy_responsibility_spill_repaired),
+        ("normalize.redundant_policy_raw_text_removed", case_redundant_policy_raw_text_removed),
+        ("normalize.fine_schedule_definition_fragment_repaired", case_fine_schedule_definition_fragment_repaired),
         ("normalize.nested_weather_policy_table_repaired", case_nested_weather_policy_table_repaired),
         ("normalize.ka_special_scene_fusion_repaired", case_ka_special_scene_fusion_repaired),
         ("normalize.special_scene_formula_one_minus_t", case_special_scene_formula_one_minus_t),

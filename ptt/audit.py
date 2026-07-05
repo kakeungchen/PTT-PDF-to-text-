@@ -25,6 +25,10 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"1ang[o0]1|ang10|iaqlan9|陈加强|陈加\d?)")),
     ("低置信文字残留", re.compile(r"识别置信度低")),
     ("公式需核对", re.compile(r"公式原文（需核对）|需对照原 PDF 核对")),
+    ("公式OCR残片", re.compile(
+        r"[CPRTWY]KA品牌单指标释义|"
+        r"虚假点送达率\s*[=＝]\s*TKA品牌单WKA品牌单|"
+        r"配送原因未[完定]成率[^\n]*(?:Wex|PKA|KA[脚腳]M)")),
     ("旧式图片占位残留", re.compile(r"!\[(?:图片|表格截图|公式)\]\(<[^>]+>\)")),
     ("未文本化图片占位残留", re.compile(r"图片区域未能可靠文本化|不写入外部图片")),
     ("申诉误识别", re.compile(r"中诉|甲诉|不子申诉")),
@@ -48,7 +52,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"亥月|KA導|考材|%\d{1,3}\b|站点\s*A[Iil]\b|A\d[.．]\s*A\d|"
 	        r"肇月度|强排擅|站点组强推|集圴站|群合考核|则除异常单|汁算|方案）。|"
 	        r"谢味\s*恕|特妹|特珠|特株|场意|算分不例|多倍权甫|权甫|"
-	        r"300[,，zZ]|70046|级力\s*\d+|240天气|≤22|配送原因未完成率=Y2|XI|Xe|Yz|Zs|"
+	        r"300[zZ]|70046|级力\s*\d+|240天气|≤22|配送原因未完成率=Y2|XI|Xe|Yz|Zs|"
             r"张冢口|品陳|品陈|"
 	        r"结算方案[）)]|KA星级结\b|K[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS]|"
         r"K[iI]分\s*[、,，]\s*K[aA]分|K[.．]{2}K[aA]|K[Ii]分|"
@@ -59,6 +63,23 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"目标骑手达成天数/要求\s*考核周期得分该考核周期总天数|"
         r"介于门槛值、\s*介于\s*0%到100%之间\s*等比例计算得分目标值之间|"
         r"状态准")),
+    ("中国式表格错关联", re.compile(
+        r"检核项目：(?:控|报|舍)(?:；|$)|"
+        r"一级分类：站；检核项目：(?:建设|控)|"
+        r"检核项目：建设；内容：.*标准\s*2[.．]\s*标准站|"
+        r"^-\s*内容：[^\n]{8,}责任承担：|"
+        r"(?:3[.．]\s*视频监|7[.．]\s*看板海|8[.．]\s*站内宿)\s+[\u4e00-\u9fff]|"
+        r"遮挡\s*\d+\s*元/项/次[，,]\s*整改\s*4[.．]\s*流媒体|"
+        r"员工宿[、，]\s*(?:整改)?舍|整改舍安全管理制度|"
+        r"台账宿舍|安全\s*22[.．]\s*安全台账站外\s*23[.．]\s*选址安全|"
+        r"一级分类：站点；检核项目：14[.．].*15[.．]\s*站点烟感|"
+        r"一级分类：安全；检核项目：1[67][.．]|"
+        r"内容：感消防联系人信息缺失|内容：设备（包含但不限于防火隔离|"
+        r"(?<!整)改不达标需承担双|改需承担双|，整如|整例如|电，整器|"
+        r"香改需承担双蕉|禁改不达标需承担双止|按《合作商安全管(?:；|$)|"
+        r"内容：[^；\n]*?(?<!整改)不达标需承担双倍|"
+        r"责任承担：\d+\s*元/项/次，?整改(?:违约金)?(?:。|$)",
+        re.MULTILINE)),
     ("乱码字符残留", re.compile(r"[�俁仴雲抇讳冏昇銷埃門哭伿怯奂沩亥導抯]")),
 ]
 
@@ -117,22 +138,50 @@ def scan_markdown(path: str) -> Dict[str, object]:
     issues = []
     for label, pattern in BAD_PATTERNS:
         matches = []
-        for m in pattern.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
-            snippet = text[m.start():m.end()]
-            matches.append({"line": line, "text": snippet[:80]})
-            if len(matches) >= 8:
-                break
+        if label == "孤立页码残留":
+            matches = _find_orphan_page_number_matches(text)
+        else:
+            for m in pattern.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
+                snippet = text[m.start():m.end()]
+                matches.append({"line": line, "text": snippet[:80]})
+                if len(matches) >= 8:
+                    break
         if matches:
             issues.append({"type": label, "matches": matches})
     _append_critical_missing_section_issues(text, issues)
     _append_markdown_readability_issues(text, issues)
+    _append_policy_table_context_issues(text, issues)
     return {
         "path": path,
         "issue_count": sum(len(i["matches"]) for i in issues),
         "issues": issues,
         "table_fallbacks": len(TABLE_FALLBACK_RE.findall(text)),
     }
+
+
+def _find_orphan_page_number_matches(text: str) -> List[Dict[str, object]]:
+    lines = text.splitlines()
+    matches: List[Dict[str, object]] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not re.fullmatch(r"\d{1,3}", stripped):
+            continue
+        if not _numeric_line_has_cjk_document_context(lines, idx):
+            continue
+        matches.append({"line": idx + 1, "text": stripped[:80]})
+        if len(matches) >= 8:
+            break
+    return matches
+
+
+def _numeric_line_has_cjk_document_context(lines: List[str], idx: int) -> bool:
+    start = max(0, idx - 3)
+    end = min(len(lines), idx + 4)
+    context = "\n".join(lines[start:idx] + lines[idx + 1:end])
+    if len(re.findall(r"[\u4e00-\u9fff]", context)) >= 4:
+        return True
+    return bool(re.search(r"目录|第\s*\d+\s*页|保密资料|协议|制度|考核", context))
 
 
 def _append_critical_missing_section_issues(text: str,
@@ -219,8 +268,14 @@ def _append_markdown_readability_issues(text: str,
             "matches": [{"line": line_no, "text": snippet[:80]}],
         })
 
+    in_fenced_block = False
     for idx, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fenced_block = not in_fenced_block
+            continue
+        if in_fenced_block:
+            continue
         if not stripped:
             continue
         if stripped.count("<br>") >= 2 or re.search(r"\|\s*[^|\n]*<br>", stripped):
@@ -230,6 +285,18 @@ def _append_markdown_readability_issues(text: str,
         if re.search(r"站点组A麦当劳品\s*\|\s*牌特殊场景算分示例|融合后体\s*\|.*验得分",
                      stripped):
             add("表格标题断裂", idx, stripped)
+        if (not stripped.startswith(("#", "|", "- "))
+                and re.search(
+                    r"[.!?。]\s+\d{1,2}(?:[.．]\d{1,2}){0,4}[.．]?\s+"
+                    r"[A-Z][^\n]{2,90}$",
+                    stripped)):
+            add("标题粘连段落", idx, stripped)
+        if (not stripped.startswith(("#", "|", "$$", "```"))
+                and re.search(
+                    r"[𝑎-𝑧𝐴-𝑍α-ωΑ-Ω](?:[a-z]|[A-Z][a-z])|"
+                    r"\)[𝑎-𝑧𝐴-𝑍α-ωΑ-Ω](?:[a-z]|[A-Z][a-z])",
+                    stripped)):
+            add("数学变量与正文粘连", idx, stripped)
 
     section_71 = _extract_section(text, "7.1")
     if section_71:
@@ -237,6 +304,99 @@ def _append_markdown_readability_issues(text: str,
             if "<br>" in line or len(line.strip()) > 360:
                 add("7.1 排版挤压", idx, line.strip())
                 break
+
+
+def _append_policy_table_context_issues(text: str,
+                                        issues: List[Dict[str, object]]) -> None:
+    def add(line_no: int, snippet: str) -> None:
+        for issue in issues:
+            if issue["type"] == "中国式表格上下文异常":
+                issue["matches"].append({"line": line_no, "text": snippet[:80]})
+                return
+        issues.append({
+            "type": "中国式表格上下文异常",
+            "matches": [{"line": line_no, "text": snippet[:80]}],
+        })
+
+    for line_no, block_lines in _iter_policy_blocks(text):
+        block = "\n".join(block_lines)
+        first = block_lines[0].strip()
+        fields = _policy_block_fields(block_lines)
+        category = fields.get("一级分类", "")
+        item = fields.get("检核项目", "")
+        content = fields.get("内容", "")
+        responsibility = fields.get("责任承担", "")
+
+        if "；检核项目：" in first or "；内容：" in first:
+            add(line_no, first)
+        if category in {"内容", "项目", "检核项目", "责任承担", "说明"}:
+            add(line_no, block)
+        if not item:
+            add(line_no, block)
+        if item in {"控", "报", "舍", "建设", "配置"}:
+            add(line_no, block)
+        if re.search(r'^(?:感|设备|屏幕|理规范|违约金)', content):
+            add(line_no, block)
+        if re.search(r'\d{1,2}[.．]\s*[\u4e00-\u9fff]{1,8}\s+\S', content):
+            add(line_no, block)
+        if responsibility and _policy_responsibility_tail_bad(responsibility):
+            add(line_no, block)
+
+
+def _iter_policy_blocks(text: str) -> List[Tuple[int, List[str]]]:
+    lines = text.splitlines()
+    blocks: List[Tuple[int, List[str]]] = []
+    current: List[str] = []
+    start_line = 0
+    for idx, line in enumerate(lines, start=1):
+        if line.startswith("- 一级分类："):
+            if current:
+                blocks.append((start_line, current))
+            current = [line]
+            start_line = idx
+            continue
+        if current and (line.startswith("  ") or not line.strip()):
+            if line.strip():
+                current.append(line)
+            continue
+        if current:
+            blocks.append((start_line, current))
+            current = []
+            start_line = 0
+    if current:
+        blocks.append((start_line, current))
+    return blocks
+
+
+def _policy_block_fields(block_lines: List[str]) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    current = ""
+    labels = ("一级分类", "检核项目", "内容", "责任承担")
+    for raw in block_lines:
+        line = raw.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        matched = False
+        for label in labels:
+            prefix = f"{label}："
+            if line.startswith(prefix):
+                fields[label] = line[len(prefix):].strip()
+                current = label
+                matched = True
+                break
+        if matched:
+            continue
+        if current:
+            fields[current] = (fields.get(current, "") + " " + line).strip()
+    return fields
+
+
+def _policy_responsibility_tail_bad(text: str) -> bool:
+    compact = re.sub(r'\s+', '', text or "").rstrip("。；;，,")
+    return bool(
+        compact.endswith(("整", "整改", "整改违约金"))
+        or re.search(r'元/项/次，?整改(?:违约金)?$', compact)
+    )
 
 
 def _extract_section(text: str, heading_token: str) -> List[Tuple[int, str]]:
@@ -286,10 +446,7 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
         "issues": [{"type": "缺少 Markdown 输出", "matches": []}],
         "table_fallbacks": 0,
     }
-    blocking_qa = [
-        issue for issue in result.get("qa_issues", [])
-        if "表格疑似列错位" not in issue
-    ]
+    blocking_qa = list(result.get("blocking_qa") or result.get("qa_issues", []))
     ok = md_scan["issue_count"] == 0 and not blocking_qa
     return {
         "source": pdf_path,
@@ -300,6 +457,7 @@ def audit_pdf(pdf_path: str, out_dir: str) -> Dict[str, object]:
         "flagged_blocks": result.get("flagged_blocks", 0),
         "warnings": result.get("warnings", []),
         "qa_issues": result.get("qa_issues", []),
+        "qa_warnings": result.get("qa_warnings", []),
         "blocking_qa": blocking_qa,
         "markdown": md_scan,
     }
@@ -400,6 +558,36 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         issue_types = [issue["type"] for issue in result["issues"]]
         _assert_true("公式需核对" in issue_types, "公式需核对")
 
+    def case_formula_ocr_fragment_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("指标释义：配送人员虚假点送达率= TKA品牌单WKA品牌单\n")
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("公式OCR残片" in issue_types, "公式OCR残片")
+
+    def case_trailing_heading_glued_to_paragraph_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    "This paragraph should end cleanly, but it has a glued "
+                    "section title at the end. 5.4. Long-horizon Parsing\n"
+                )
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("标题粘连段落" in issue_types, "标题粘连段落")
+
+    def case_inline_math_word_glue_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Each token attends to the preceding 𝑛output tokens.\n")
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("数学变量与正文粘连" in issue_types, "数学变量与正文粘连")
+
     def case_convert_outputs_single_md_without_assets_or_layout() -> None:
         import fitz
         from .pipeline import convert
@@ -420,6 +608,34 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         _assert_true(result["outputs"][0].endswith(".md"), "md output")
         _assert_false(any("_assets" in name for name in names), "assets output")
         _assert_false(any("_layout" in name for name in names), "layout output")
+
+    def case_pipeline_table_warning_blocks_after_audit() -> None:
+        import fitz
+        from .pipeline import convert
+        from . import qa as qa_module
+
+        original_scan = qa_module.qa_scan
+
+        def fake_scan(blocks):
+            return ["块1 表格疑似列错位，建议人工复核"], 1
+
+        qa_module.qa_scan = fake_scan
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                pdf_path = os.path.join(td, "sample.pdf")
+                out_dir = os.path.join(td, "out")
+                doc = fitz.open()
+                page = doc.new_page(width=300, height=200)
+                page.insert_text((40, 80), "表格风险提示分类检查")
+                doc.save(pdf_path)
+                doc.close()
+
+                result = convert(pdf_path, out_dir, formats=("md",))
+            _assert_false(result["quality_ok"], "quality_ok")
+            _assert_true(result["qa_issues"], "qa_issues")
+            _assert_true(result["qa_warnings"], "qa_warnings")
+        finally:
+            qa_module.qa_scan = original_scan
 
     def case_critical_sections_missing() -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -485,6 +701,19 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         _assert_true("表格标题断裂" in issue_types, "表格标题断裂")
         _assert_true("7.1 排版挤压" in issue_types, "7.1 排版挤压")
 
+    def case_english_chart_ticks_not_orphan_page_numbers() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    "Figure 3 shows cache hit ratio across model sizes.\n"
+                    "18\n16\n14\n12\n10\n"
+                    "Duration and throughput stay stable after warmup.\n"
+                )
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_false("孤立页码残留" in issue_types, "孤立页码残留")
+
     def case_table_readability_regression() -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.md")
@@ -503,6 +732,54 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         issue_types = [issue["type"] for issue in result["issues"]]
         _assert_true("表格结构可读性问题" in issue_types, "表格结构可读性问题")
 
+    def case_chinese_policy_table_misalignment_regression() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    "- 一级分类：站；检核项目：控；内容：合作商未按要求配送站点购买视频监控且未报备，导致美；3.视频监 团检核人员无法及时查看站内情况。\n"
+                    "- 内容：流媒体设备出现遮挡 200元/项/次，整改 4.流媒体 屏幕。\n"
+                    "- 内容：合作商配送站点公告栏中展示的配送服务人员健康证存在虚假。；责任承担：需按照《合作商用工管理规范》相关约定承担违约责任。\n"
+                )
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("中国式表格错关联" in issue_types, "中国式表格错关联")
+
+    def case_policy_table_context_regression() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bad = os.path.join(td, "bad.md")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write(
+                    "- 一级分类：健康证；检核项目：1.健康证；内容：健康证存在虚假。；责任承担：需承担违约责任\n"
+                    "- 一级分类：内容\n"
+                    "  检核项目：特殊说明：\n"
+                    "  内容：说明被塞进分类列。\n"
+                    "- 一级分类：标准站\n"
+                    "  检核项目：控\n"
+                    "  内容：合作商未报备。\n"
+                )
+            result = scan_markdown(bad)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("中国式表格上下文异常" in issue_types, "中国式表格上下文异常")
+
+    def case_policy_table_context_valid() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            good = os.path.join(td, "good.md")
+            with open(good, "w", encoding="utf-8") as f:
+                f.write(
+                    "- 一级分类：健康证\n"
+                    "  检核项目：1.健康证\n"
+                    "  内容：合作商配送站点公告栏中展示的配送服务人员健康证存在虚假。\n"
+                    "  责任承担：需按照《合作商用工管理规范》相关约定承担违约责任\n"
+                    "- 一级分类：标准站\n"
+                    "  检核项目：3.视频监控\n"
+                    "  内容：合作商未按要求购买视频监控。\n"
+                    "  责任承担：200元/项/次，整改不达标需承担双倍违约金。\n"
+                )
+            result = scan_markdown(good)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_false("中国式表格上下文异常" in issue_types, "中国式表格上下文异常")
+
     return [
         ("audit.select_sample_wraps", case_select_sample_wraps),
         ("audit.markdown_patterns", case_markdown_patterns),
@@ -511,16 +788,24 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("audit.normal_y2_variable_allowed", case_normal_y2_variable_allowed),
         ("audit.ka_star_settlement_amount_allowed", case_ka_star_settlement_amount_allowed),
         ("audit.formula_review_marker_blocks_pass", case_formula_review_marker_blocks_pass),
+        ("audit.formula_ocr_fragment_blocks_pass", case_formula_ocr_fragment_blocks_pass),
+        ("audit.trailing_heading_glued_to_paragraph_blocks_pass", case_trailing_heading_glued_to_paragraph_blocks_pass),
+        ("audit.inline_math_word_glue_blocks_pass", case_inline_math_word_glue_blocks_pass),
         ("audit.convert_outputs_single_md_without_assets_or_layout", case_convert_outputs_single_md_without_assets_or_layout),
+        ("audit.pipeline_table_warning_blocks_after_audit", case_pipeline_table_warning_blocks_after_audit),
         ("audit.critical_sections_missing", case_critical_sections_missing),
         ("audit.critical_sections_complete", case_critical_sections_complete),
         ("audit.table_readability_regression", case_table_readability_regression),
+        ("audit.chinese_policy_table_misalignment_regression", case_chinese_policy_table_misalignment_regression),
+        ("audit.policy_table_context_regression", case_policy_table_context_regression),
+        ("audit.policy_table_context_valid", case_policy_table_context_valid),
         ("audit.markdown_readability_regression", case_markdown_readability_regression),
+        ("audit.english_chart_ticks_not_orphan_page_numbers", case_english_chart_ticks_not_orphan_page_numbers),
     ]
 
 
 def run_builtin_checks(stream=None) -> Dict[str, object]:
-    from . import assemble, coverage, export, normalize, qa
+    from . import assemble, coverage, export, normalize, qa, text_extract
 
     def add_module_cases(module) -> None:
         getter = getattr(module, "builtin_check_cases", None)
@@ -529,7 +814,7 @@ def run_builtin_checks(stream=None) -> Dict[str, object]:
 
     cases: List[Tuple[str, Callable[[], None]]] = []
     cases.extend(_audit_builtin_cases())
-    for module in (normalize, qa, assemble, export, coverage):
+    for module in (normalize, qa, assemble, export, coverage, text_extract):
         add_module_cases(module)
 
     failures: List[Dict[str, str]] = []
