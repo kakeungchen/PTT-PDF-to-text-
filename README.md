@@ -1,98 +1,141 @@
 <div align="center">
 
-<img src="ptt/assets/logo.svg" width="120" alt="ptt logo"/>
+<img src="ptt/assets/logo-ocr.png" width="112" alt="ptt OCR logo"/>
 
-# ptt — PDF to Text
+# ptt — Local PDF OCR for Mac
 
-**Turn any PDF into clean Markdown. 100% on-device.**
+**Turn difficult PDFs into clean, editable, searchable Markdown or Word documents.**
 
 English · [简体中文](README.zh-CN.md)
 
-`macOS 12+` · `Apple Silicon / Intel` · `8GB RAM is enough` · `No cloud, no upload`
+`100% on-device` · `No file uploads` · `Apple Vision OCR` · `Apple Silicon / Intel`
 
-<img src="docs/screenshot-ui.png" width="680" alt="ptt UI"/>
+<img src="docs/screenshot-ui.png" width="760" alt="ptt macOS interface"/>
 
 </div>
 
 ---
 
-## Why ptt
+## PDFs can be messy. The output should not be.
 
-Most PDF converters either send your files to a server, or produce a wall of garbled text the moment they meet a scanned page, a watermark, or a table. **ptt** is built on one principle: **accuracy over speed** — and everything runs locally on your Mac using Apple's built-in Vision OCR. Your documents never leave your device.
+Scanned documents, ultra-long screenshots exported from workplace apps, full-page watermarks, repeated headers, cross-page tables, formulas, and diagrams may all arrive as PDFs. Ordinary copy-and-paste tools — and many online converters — struggle as soon as the document stops being simple.
 
-It was battle-tested on the hardest kind of real-world input: ultra-long screenshot PDFs exported from Feishu/DingTalk (single pages over 65,000 px tall, beyond what most JPEG decoders can even open), full of confidential watermarks, repeated headers, cross-page tables and embedded formulas.
+**ptt is an on-device OCR utility designed for Mac.** It decides whether each page should use its embedded text layer or Apple's built-in Vision OCR, then restores reading order, reconstructs useful structure, and checks the result for likely omissions and recognition errors.
 
-## Features
+Everything runs on your Mac. Contracts, financial material, internal policies, and research documents never need to be uploaded to a third-party server.
 
-| | |
+## Recognition matters. Trust matters more.
+
+Many OCR tools silently turn an unclear character, formula, or number into a confident-looking answer. ptt takes a more careful approach:
+
+- High-confidence content becomes clean headings, paragraphs, and tables.
+- Low-confidence regions are enlarged, recognized again, and cross-checked.
+- Anything still uncertain is explicitly flagged for human review.
+- OCR guesses are never presented as verified facts.
+
+The default principle is simple: **accuracy over speed, and uncertainty over silent errors.**
+
+## Built for real document work
+
+- Convert scanned contracts, policies, and reports into editable text.
+- Process ultra-long screenshot PDFs exported from Feishu, DingTalk, and similar apps.
+- Extract the body from documents with watermarks, page numbers, and repeating headers.
+- Produce Markdown for search, knowledge bases, version control, or AI agents.
+- Generate Word files when the result needs further editing, comments, or delivery.
+
+## Core capabilities
+
+| Capability | How ptt handles it |
 |---|---|
-| **Text & scanned PDFs** | Native text layer extraction; on-device Chinese/English OCR for scans and ultra-long screenshot PDFs |
-| **Watermark removal** | Diagonal / light-colored security watermarks and repeated confidentiality banners are stripped automatically |
-| **Header & footer removal** | Doc IDs, page numbers, logos and periodic repeats — including the "virtual pages" inside stitched long screenshots |
-| **Table reconstruction** | Simple tables stay as Markdown tables; cross-page, merged-cell, multi-header, and long-description tables are rewritten into readable grouped text |
-| **Formulas & diagrams** | Content OCR can't faithfully linearize (fractions, subscripts, flowcharts) is marked as **formula text requiring review** instead of guessed as correct text |
-| **Figure text, structured** | Text inside diagrams is re-laid-out by geometry into readable tables — both humans and AI agents can parse it |
-| **Self-checking QA loop** | Low-confidence content is re-OCR'd at 2× zoom; headings, formulas, key numbers, and metric names are checked for source-to-output coverage; anything still uncertain is **explicitly flagged** |
-| **Clean output** | Temp crops and intermediate assets are deleted automatically — the default conversion leaves one `.md` file |
-| **Agent-friendly** | CLI with JSON output mode: progress on stderr, machine-readable results on stdout |
+| **Text and scanned PDFs** | Uses the embedded text layer when available, otherwise runs local Chinese/English OCR with Apple Vision |
+| **Ultra-long screenshot PDFs** | Recognizes very tall pages in overlapping tiles and removes duplicate text between tiles |
+| **Watermarks, headers, and footers** | Detects repeated page content and filters light watermarks, page numbers, document IDs, and recurring notices |
+| **Table reconstruction** | Keeps straightforward tables as Markdown tables and rewrites complex cross-page tables into readable grouped structures |
+| **Formulas and diagrams** | Flags regions that cannot be reliably linearized instead of inventing plausible-looking formulas |
+| **Quality checks** | Re-runs uncertain OCR and audits coverage for headings, key numbers, and metric names |
+| **Clean output** | Removes temporary crops and intermediate assets after conversion |
+| **Batch workflow** | Adds multiple PDFs from the GUI and shows per-file waiting, progress, success, and failure states |
 
 ## Quick start
 
-### GUI
+### Graphical interface
 
-1. Double-click **`启动ptt.command`** (first run installs dependencies once, ~1–2 min online; fully offline afterwards).
-   - If macOS blocks it: right-click → Open → Open.
-2. Drag PDFs into the window, pick output formats, hit **开始转换**.
-3. Results land next to each source file in a `转换结果` folder — or anywhere you choose via **自定义…**.
+1. Double-click [`启动ptt.command`](启动ptt.command).
+2. On first launch, ptt creates its environment and installs dependencies. This needs an internet connection for roughly 1–3 minutes; OCR runs offline afterwards.
+3. Drag one or more PDFs into the window and choose Markdown, Word, or both.
+4. Click **开始转换**.
+5. Results are saved to a `转换结果` folder next to each source file by default. Click the destination control to choose another folder.
 
-### CLI / AI agents
+If macOS blocks the launcher, right-click it, choose **Open**, and confirm once more.
+
+### Output formats
+
+- **Markdown (`.md`)**: the default for knowledge bases, search, version control, and AI workflows.
+- **Word (`.docx`)**: useful for continued editing, comments, layout work, and office delivery.
+
+## CLI and agent mode
 
 ```bash
-# Basic: one Markdown file
+# Convert to Markdown
 .venv/bin/python -m ptt.cli file.pdf -o output_dir
+
+# Generate Markdown and Word
+.venv/bin/python -m ptt.cli file.pdf -o output_dir -f md docx
+
+# Machine-readable JSON on stdout; progress on stderr
+.venv/bin/python -m ptt.cli file.pdf --json
 
 # Show the current version
 .venv/bin/python -m ptt.cli --version
-
-# Agent mode: JSON to stdout, progress to stderr
-.venv/bin/python -m ptt.cli file.pdf --json
-
-# Optional Word compatibility output
-.venv/bin/python -m ptt.cli file.pdf -o output_dir -f md docx
 ```
 
-The JSON includes `outputs`, `warnings` (what was stripped / auto-corrected), `qa_issues` (locations needing human review) and `flagged_blocks`.
+JSON output includes:
 
-## How it works
+- `outputs`: generated files.
+- `warnings`: notes about removed or corrected document elements.
+- `qa_issues`: locations recommended for human review.
+- `flagged_blocks`: the number of low-confidence content blocks.
 
+## Processing pipeline
+
+```text
+PDF
+ ├─ Classify each page: embedded text / scanned image
+ ├─ Extract text directly or run tiled Vision OCR
+ ├─ Remove repeating watermarks, headers, and footers
+ ├─ Rebuild tables, figure text, and reading order
+ ├─ Re-recognize low-confidence regions at higher resolution
+ ├─ Audit content coverage and output readability
+ └─ Write Markdown, optionally Word
 ```
-PDF ──▶ per-page type detection
-     ──▶ text layer extraction  /  tiled Vision OCR (1800px strips, overlap dedup)
-     ──▶ periodic header/footer & watermark band removal
-     ──▶ ruling-based table grid reconstruction (cross-page merge)
-     ──▶ diagram / formula region detection → internal coverage ledger
-     ──▶ reading-order assembly (headings · paragraphs · tables · figures)
-     ──▶ QA: 2× re-OCR cross-check · frequency-vote typo repair · coverage audit · readability audit
-     ──▶ Markdown (.md), optionally Word (.docx)
-```
 
-No ML model downloads, no PyTorch — OCR is Apple's Vision framework, which ships with macOS. That's why the whole repo is ~40 KB.
+ptt downloads no separate OCR model and does not depend on PyTorch. Recognition is powered by the Vision framework included with macOS.
+
+## Requirements
+
+- macOS 12 or later.
+- Apple Silicon or Intel Mac.
+- 8GB RAM or more recommended.
+- Internet access for the first dependency installation only; normal OCR conversion does not upload files.
 
 ## Honest limitations
 
-- Dark watermarks burned into scanned images can't always be fully removed (light/text watermarks work well).
-- Tiny subscript glyphs (e.g. K₁) are at the edge of Vision's ability — uncertain formulas are marked for review and block a clean audit pass.
-- Text inside app-screenshot evidence images is best-effort: uncertain regions are explicitly flagged rather than silently guessed.
-- Anything the tool isn't sure about is flagged, never silently guessed.
+ptt is designed for difficult documents, but it does not promise impossible 100% accuracy:
 
-## Versioning and releases
+- Dark watermarks burned into a scanned image may not be fully removable.
+- Tiny subscripts, complex fractions, and low-resolution formulas sit at the edge of OCR capability.
+- Very small text inside screenshots may require comparison with the original PDF.
+- Tables with unusual merged cells or no visible structure may become grouped text instead of the original grid.
 
-- The current app version lives in [ptt/__init__.py](ptt/__init__.py).
-- Follow semantic versioning:
-  - `0.1.1` for bug fixes
-  - `0.2.0` for backward-compatible features
-  - `1.0.0` for the first stable public release
-- Keep release notes in [CHANGELOG.md](CHANGELOG.md).
-- Use Git tags like `v0.1.0` so GitHub Releases and local history stay aligned.
+When content cannot be confirmed reliably, ptt prefers an explicit review warning over a silent guess.
 
-The step-by-step GitHub publishing flow is documented in [docs/release-process.md](docs/release-process.md).
+## Development and release
+
+- Current version: [`ptt/__init__.py`](ptt/__init__.py)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Release guide: [`docs/release-process.md`](docs/release-process.md)
+- Design QA: [`design-qa.md`](design-qa.md)
+
+## License
+
+[Apache License 2.0](LICENSE)
