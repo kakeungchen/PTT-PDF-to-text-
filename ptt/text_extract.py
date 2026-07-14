@@ -344,7 +344,9 @@ def extract_text_page(doc: fitz.Document, pno: int, repeated: set,
             gap = y0 - prev[3]
             size_changed = abs(size - prev[4]) > 1
             keep_sentence = _continues_unfinished_text_line(prev[5], text)
-            if (gap > size * 0.8 or size_changed) and not keep_sentence:
+            starts_labeled_paragraph = _starts_bold_label_line(text, bold)
+            if (starts_labeled_paragraph
+                    or ((gap > size * 0.8 or size_changed) and not keep_sentence)):
                 flush()
                 flush_pending_caption()
                 flush_pending_math()
@@ -362,6 +364,19 @@ def extract_text_page(doc: fitz.Document, pno: int, repeated: set,
 
 def _is_caption_start(text: str) -> bool:
     return bool(_CAPTION_START_RE.match((text or "").strip()))
+
+
+def _starts_bold_label_line(text: str, bold: bool) -> bool:
+    """Keep a visually distinct bold label on its own Markdown paragraph."""
+    if not bold:
+        return False
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean or ":" not in clean and "：" not in clean:
+        return False
+    return bool(re.match(
+        r"^(?:[A-Z][A-Za-z0-9 /&()'\-]{1,48}|[\u4e00-\u9fff]{2,16})[:：]\s*\S+",
+        clean,
+    ))
 
 
 def _is_equation_number_line(text: str) -> bool:
@@ -1299,6 +1314,14 @@ def builtin_check_cases():
         assert not _continues_unfinished_text_line("Contents", "1 Introduction")
         assert not _continues_unfinished_text_line("8. Conclusion", "In this technical report")
 
+    def case_bold_label_starts_new_paragraph() -> None:
+        assert _starts_bold_label_line(
+            "Core Contributors: Youyang Yin, Huanhuan Liu", True)
+        assert _starts_bold_label_line("数据来源：烽火台系统", True)
+        assert not _starts_bold_label_line(
+            "Core Contributors: Youyang Yin, Huanhuan Liu", False)
+        assert not _starts_bold_label_line("ordinary paragraph text", True)
+
     def case_metric_pages_table_rebuilt_from_text_pdf_fragments() -> None:
         rows = [
             ["Pages", "2 5 10 15 20 40+"],
@@ -1356,6 +1379,7 @@ def builtin_check_cases():
         ("text_extract.wrapped_hyphenated_words_repaired", case_wrapped_hyphenated_words_repaired),
         ("text_extract.inline_math_variable_spacing_repaired", case_inline_math_variable_spacing_repaired),
         ("text_extract.unfinished_line_continuation_allowed_across_size_change", case_unfinished_line_continuation_allowed_across_size_change),
+        ("text_extract.bold_label_starts_new_paragraph", case_bold_label_starts_new_paragraph),
         ("text_extract.metric_pages_table_rebuilt_from_text_pdf_fragments", case_metric_pages_table_rebuilt_from_text_pdf_fragments),
         ("text_extract.subcategory_table_rebuilt_from_text_pdf_fragments", case_subcategory_table_rebuilt_from_text_pdf_fragments),
         ("text_extract.tps_table_rebuilt_from_text_pdf_fragments", case_tps_table_rebuilt_from_text_pdf_fragments),
