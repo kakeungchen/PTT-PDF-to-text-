@@ -358,8 +358,26 @@ def extract_text_page(doc: fitz.Document, pno: int, repeated: set,
 
     _promote_adjacent_math_fragments(blocks)
     _split_trailing_numbered_headings(blocks)
+    _append_unlisted_pdf_links(page, blocks)
     blocks.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
     return blocks, notes
+
+
+def _append_unlisted_pdf_links(page: fitz.Page, blocks: List[Block]) -> None:
+    """Expose URI annotations that are not present in the visible text layer."""
+    visible = "\n".join(block.text or "" for block in blocks)
+    for link in page.get_links():
+        uri = (link.get("uri") or "").strip()
+        if not re.match(r"https?://\S+$", uri, re.I) or uri in visible:
+            continue
+        rect = fitz.Rect(link.get("from") or page.rect)
+        blocks.append(Block(
+            kind="para",
+            text=f"PDF链接：<{uri}>",
+            page=page.number,
+            bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
+            flags=["pdf_link"],
+        ))
 
 
 def _is_caption_start(text: str) -> bool:
@@ -1364,6 +1382,30 @@ def builtin_check_cases():
         assert fixed[1][:3] == ["Deepseek OCR", "7229.32", "7468.27"]
         assert fixed[2][-1] == "7847.71"
 
+    def case_unlisted_pdf_link_is_exported() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "link.pdf")
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            page.insert_text((30, 40), "引用[1]", fontsize=12)
+            page.insert_link({
+                "kind": fitz.LINK_URI,
+                "from": fitz.Rect(30, 20, 100, 45),
+                "uri": "https://example.com/hidden_reference",
+            })
+            doc.save(path)
+            doc.close()
+            doc = fitz.open(path)
+            blocks, _notes = extract_text_page(
+                doc, 0, set(), os.path.join(td, "assets"), "sample",
+                preserve_images=False, detect_formula_images=False)
+            doc.close()
+            assert any(
+                "https://example.com/hidden_reference" in block.text
+                and "pdf_link" in block.flags
+                for block in blocks
+            )
+
     return [
         ("text_extract.markdown_skips_plain_text_pdf_images", case_markdown_skips_plain_text_pdf_images),
         ("text_extract.word_preserves_text_pdf_images", case_word_preserves_text_pdf_images),
@@ -1383,4 +1425,5 @@ def builtin_check_cases():
         ("text_extract.metric_pages_table_rebuilt_from_text_pdf_fragments", case_metric_pages_table_rebuilt_from_text_pdf_fragments),
         ("text_extract.subcategory_table_rebuilt_from_text_pdf_fragments", case_subcategory_table_rebuilt_from_text_pdf_fragments),
         ("text_extract.tps_table_rebuilt_from_text_pdf_fragments", case_tps_table_rebuilt_from_text_pdf_fragments),
+        ("text_extract.unlisted_pdf_link_is_exported", case_unlisted_pdf_link_is_exported),
     ]

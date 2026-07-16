@@ -69,9 +69,12 @@ def _readable_text_lines(text: str) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
+    text = re.sub(r'([（(])\s*\n+\s*(\d{1,2}[）)])', r'\1\2', text)
     text = re.sub(r'\s*<br\s*/?>\s*', "\n", text, flags=re.I)
     text = re.sub(r'[；;]\s*(?=(?:注[①②]?[:：]|其中|考核范围[:：]|'
                   r'数据来源[:：]|数据获取方式[:：]|指标说明[:：]|'
+                  r'数据播报[:：]|违规结果播报[:：]|降星规则[:：]|'
+                  r'申诉流程及时效[:：]|公示流程[:：]|'
                   r'举例\d*[:：]|举例如下[:：]|示例[:：]|剔除方式[:：]|'
                   r'特殊说明[:：]|同时满足如下条件))',
                   "\n", text)
@@ -80,26 +83,31 @@ def _readable_text_lines(text: str) -> List[str]:
     text = re.sub(r'[；;]+\s*(?=(?:条件[一二三四五六七八九十][:：]|'
                   r'[1-9][.．]\s*[^0-9]|PS[:：]|备注[:：]))',
                   "\n", text)
-    text = re.sub(r'(?<!^)(?=(?:注[①②]?[:：]|其中，|其中[:：]|'
+    text = re.sub(r'(?<!^)(?<![①②③④⑤⑥⑦⑧⑨⑩] )(?=(?:注[①②]?[:：]|其中，|其中[:：]|'
                   r'指标定义\d*[:：]|计算公式[:：]|核算公式[:：]|'
                   r'计分规则\d*[:：]|数据来源[:：]|指标说明[:：]|'
+                  r'数据播报[:：]|违规结果播报[:：]|降星规则[:：]|'
+                  r'申诉流程及时效[:：]|公示流程[:：]|'
                   r'考核范围[:：]|数据获取方式[:：]|剔除方式[:：]|'
                   r'分数计算规则[:：]))',
                   "\n", text)
-    text = re.sub(r'(?<!^)(?<!算分)(?=(?:举例\d*[:：]|举例如下[:：]|示例[:：]))', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=计算示例[:：])', "\n", text)
+    text = re.sub(r'(?<!^)(?<!算分)(?<!计算)(?=(?:举例\d*[:：]|举例如下[:：]|示例[:：]))', "\n", text)
     text = re.sub(r'(?<=[。；;])\s*(?=[①②③④⑤⑥⑦⑧⑨]\s*)', "\n", text)
     text = re.sub(r'(?<=[。.!?；;])\s*(?=[•·▪]\s*)', "\n", text)
     text = re.sub(r'(?<=[。；;])\s*(?=[1-9][.．]\s*[\u4e00-\u9fff])', "\n", text)
     text = re.sub(r'(?<=[。；;])\s*(?=其中)', "\n", text)
     text = re.sub(r'(?<=[。；;])\s*(?=注[①②]?[:：])', "\n", text)
-    text = re.sub(r'(?<=[。；;])\s*(?=【[^】]{2,24}】[:：])', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=特殊说明[:：])', "\n", text)
+    text = re.sub(r'(?<=[。；;])\s*(?=【[^】]{2,24}】)', "\n", text)
     text = re.sub(r'(?<!^)(?=(?:全月基础服务费=|每日计费服务质量等级数))', "\n", text)
-    text = re.sub(r'(?<!^)(?=(?:[①②③④⑤⑥⑦⑧⑨]|[1-9][）)]|[1-9][.．])\s*'
-                  r'(?:当|参与|同商|考核|数据|电话|风控|不满意|如|若))',
+    text = re.sub(r'(?<!^)(?<![（(])(?=(?:[①②③④⑤⑥⑦⑧⑨]|'
+                  r'[（(]?[1-9][）)]|[1-9][.．])\s*'
+                  r'(?:当|参与|同商|考核|数据|电话|风控|不满意|如|若|该|因))',
                   "\n", text)
     text = re.sub(r'(?<!^)(?=(?:麦当劳|肯德基|必胜客)完单量占比=)', "\n", text)
     text = re.sub(r'(?<!^)(?=30分钟内送达订单占比（)', "\n", text)
-    text = re.sub(r'(?<!^)(?=品牌方口径准时率（)', "\n", text)
+    text = re.sub(r'(?<!^)(?<!考核“)(?=品牌方口径准时率（)', "\n", text)
     text = re.sub(r'(?<=[）)])(?=具体方案详见)', "\n", text)
     out: List[str] = []
     for raw in text.splitlines():
@@ -108,6 +116,64 @@ def _readable_text_lines(text: str) -> List[str]:
             continue
         out.extend(_split_long_text_line(line))
     return out
+
+
+def _merge_visual_table_lines(text: str) -> List[str]:
+    """Join wrapped OCR lines while keeping real numbered entries separate."""
+    raw_lines = [re.sub(r"\s+", " ", line).strip()
+                 for line in (text or "").splitlines() if line.strip()]
+    if not raw_lines:
+        return []
+    entry_re = re.compile(
+        r"^(?:\d{1,2}(?:[.．]\d+)+\s*|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫]\s*|"
+        r"\d{1,2}[、．.]\s*|(?:注|特殊说明|例|说明|备注)[:：])")
+    paragraphs: List[str] = []
+    current = ""
+
+    def append_line(value: str) -> None:
+        nonlocal current
+        if not current:
+            current = value
+            return
+        if current[-1:] and value[:1] == current[-1:]:
+            current += value[1:]
+        elif (re.search(r"[A-Za-z0-9]$", current)
+              and re.match(r"[A-Za-z0-9]", value)):
+            current += " " + value
+        else:
+            current += value
+
+    for line in raw_lines:
+        if current and entry_re.match(line):
+            paragraphs.append(current)
+            current = line
+        else:
+            append_line(line)
+    if current:
+        paragraphs.append(current)
+    return paragraphs
+
+
+def _expand_grouped_policy_rows(header: List[str], body: List[List[str]]) -> List[List[str]]:
+    """Expand slash-joined policy item labels into separate readable entries."""
+    item_idx = next((idx for idx, value in enumerate(header)
+                     if value.strip() in {"检核项目", "考核项目", "项目"}), None)
+    if item_idx is None:
+        return body
+    expanded: List[List[str]] = []
+    split_re = re.compile(r"\s*[/／]\s*(?=\d{1,2}\s*[.．、])")
+    for row in body:
+        padded = list(row) + [""] * (len(header) - len(row))
+        item = padded[item_idx].strip()
+        parts = [part.strip() for part in split_re.split(item) if part.strip()]
+        if len(parts) <= 1:
+            expanded.append(padded)
+            continue
+        for part in parts:
+            cloned = list(padded)
+            cloned[item_idx] = part
+            expanded.append(cloned)
+    return expanded
 
 
 def _wrap_markdown_long_lines(md: str, limit: int = 220) -> str:
@@ -253,7 +319,11 @@ def _table_is_complex(rows_data: List[List[str]]) -> bool:
         return True
     if ncol == 2 and policy_like and re.search(r"提报条件|剔除条件", header_joined) and max_cell_len > 40:
         return True
-    if ncol in (2, 3) and max_cell_len > 85 and policy_like:
+    # A wide two/three-column table with long prose is not a compact data
+    # table, even when its header does not contain a policy keyword.  Keeping
+    # it as a pipe table creates unreadable horizontal lines and blocks the
+    # coverage readability audit.
+    if ncol in (2, 3) and max_cell_len > 90:
         return True
     if ncol >= 3 and max_cell_len > 80 and re.search(r"内容|责任承担|检核项目", header_joined):
         return True
@@ -303,9 +373,33 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
     rows = [r + [""] * (ncol - len(r)) for r in rows_data]
     header = [c.strip() for c in rows[0]]
     body = rows[1:] if len(rows) > 1 else rows
+    body = _expand_grouped_policy_rows(header, body)
 
     if ncol == 1 and len(rows) > 1:
         first_cell = header[0]
+        header_compact = re.sub(r"\s+", "", first_cell)
+        continuation = sum(
+            1 for row in body
+            if re.fullmatch(r"\s*\d{1,3}\s*", row[0] or "")
+        ) >= 3
+        if "提报条件" in header_compact or continuation:
+            label = first_cell if "提报条件" in header_compact else "提报条件续表"
+            start_rows = body if "提报条件" in header_compact else rows
+            lines.append("**" + _md_escape_text(label) + "**")
+            lines.append("")
+            for row in start_rows:
+                cell = row[0].strip()
+                if not cell:
+                    continue
+                if re.fullmatch(r"\d{1,3}", re.sub(r"\s+", "", cell)):
+                    lines.append(f"- 条件编号：{_md_escape_text(cell)}")
+                    continue
+                value_lines = _readable_text_lines(cell) or [cell]
+                for pos, value_line in enumerate(value_lines):
+                    prefix = "- 条件说明：" if pos == 0 else "  "
+                    lines.append(prefix + _md_escape_text(value_line))
+            lines.append("")
+            return
         first_is_header = len(first_cell) <= 12 and re.search(
             r"项目|内容|说明|指标|数据|路径|问题|答案|备注|目标|管理", first_cell)
         answer_like = not first_is_header and (
@@ -362,9 +456,11 @@ def _emit_readable_table(lines: List[str], rows_data: List[List[str]]) -> None:
         lines.append("**" + _md_escape_text(" / ".join(c for c in header if c)) + "**")
         lines.append("")
     header_set = {c.strip() for c in header if c.strip()}
-    policy_row_labels = {
-        "一级分类", "检核项目", "内容", "责任承担"
-    }.issubset(header_set)
+    policy_row_labels = (
+        {"一级分类", "检核项目", "内容", "责任承担"}.issubset(header_set)
+        or {"项目", "内容", "责任承担"}.issubset(header_set)
+        or {"项目", "说明", "承担责任"}.issubset(header_set)
+    )
     for row in body:
         if policy_row_labels and len(row) >= 2:
             first_cell = (row[0] or "").strip()
@@ -978,7 +1074,9 @@ def export_markdown(result: DocResult, out_path: str) -> str:
         pending_formula_text.clear()
 
     def emit_table(rows_data, flags=None):
-        if (not _native_pdf_table_prefers_markdown(rows_data, flags or [])
+        force_standard = "standard_markdown_table" in (flags or [])
+        if (not force_standard
+                and not _native_pdf_table_prefers_markdown(rows_data, flags or [])
                 and _table_is_complex(rows_data)):
             _emit_readable_table(lines, rows_data)
             return
@@ -995,6 +1093,39 @@ def export_markdown(result: DocResult, out_path: str) -> str:
             lines.append("#" * max(1, min(b.level or 1, 6)) + " "
                          + _md_escape_text(b.text))
         elif b.kind == "para":
+            if "pdf_link" in b.flags:
+                flush_formula_text_block()
+                lines.append(_xml_safe_text(b.text).strip())
+                lines.append("")
+                continue
+            if "raw_table_text_fallback" in b.flags:
+                flush_formula_text_block()
+                lines.append("**表格内容（按原文顺序）**")
+                lines.append("")
+                for paragraph in _merge_visual_table_lines(b.text):
+                    value_lines = _readable_text_lines(paragraph)
+                    for pos, value_line in enumerate(value_lines):
+                        # Raw table lines are evidence, not headings.  Keeping
+                        # each visual paragraph as one bullet prevents numeric
+                        # cells such as ``1.16`` from becoming Markdown
+                        # chapters while avoiding a bullet for every wrapped
+                        # OCR line.
+                        value_line = value_line.strip()
+                        if not value_line:
+                            continue
+                        value_line = re.sub(r"^[•·▪]\s*", "", value_line)
+                        prefix = "- " if pos == 0 else "  "
+                        lines.append(prefix + _md_escape_text(value_line))
+                lines.append("")
+                continue
+            if "structured_score_table" in b.flags:
+                flush_formula_text_block()
+                for value_line in (b.text or "").splitlines():
+                    value_line = _xml_safe_text(value_line).strip()
+                    if value_line:
+                        lines.append(value_line)
+                lines.append("")
+                continue
             if "formula_text" in b.flags:
                 pending_formula_text.append(b.text)
                 continue
@@ -1145,6 +1276,16 @@ def _remove_misleading_formula_ocr_fragments(md: str) -> str:
             continue
         if re.fullmatch(r"\s*[A-Z]\s*KA\s*品牌单\s*指标释义\s*[:：]\s*", cleaned):
             cleaned = "指标释义："
+
+        # A structured formula table may still contribute one flattened OCR
+        # line after the reliable LaTeX formula has already been emitted.  The
+        # prefix is misleading duplicate formula text; the trailing ``其中``
+        # explanation and field names remain useful source content.
+        if ("站点组KA品牌单体验得分=" in cleaned
+                and "SUM" in cleaned.upper()
+                and re.search(r"K[1N]\s*\\?\*?\s*Q[1N]", cleaned, re.I)):
+            explanation = re.search(r"其中[，,:：].*", cleaned)
+            cleaned = explanation.group(0) if explanation else ""
 
         in_546 = "5.4.6" in section and "虚假点送达率" in section
         if pending_content_heading:
@@ -1589,6 +1730,24 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "公式原文（需核对）" not in text
         assert "\n1\n\n2\n" not in text
 
+    def case_structured_score_example_keeps_field_relationships() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(
+                kind="para",
+                flags=["structured_score_table"],
+                text=(
+                    "**特殊场景算分示例明细**\n\n"
+                    "- 指标：复合准时率；分子数值：一般超时5单；严重超时0单；"
+                    "分母数值：100；达标率（值）：95%；满分目标：96%；权重：50%；得分：110\n"
+                    "\n**融合后体验得分核算**\n\n"
+                    "- 特殊场景完成单占比：=100/（1000+100）=9.0909%"
+                ),
+            )
+        ]))
+        assert "分子数值：一般超时5单；严重超时0单" in text
+        assert "融合后体验得分核算" in text
+        assert "表格内容（按原文顺序）" not in text
+
     def case_image_table_exports_text_without_asset_link() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="image", rows=[["数据", "查询路径"], ["KA", "系统"]],
@@ -1745,6 +1904,46 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "普通场景算分\n示例" not in text
         assert "特殊场景算分\n示例" not in text
         assert "普通场景算分示例：假设站点组A履约。" in text
+
+    def case_bracket_label_after_sentence_gets_own_line() -> None:
+        lines = _readable_text_lines(
+            "第一项说明结束。【完成订单量】通过美团配送且最终状态为完成的订单数量。"
+        )
+        assert lines == [
+            "第一项说明结束。",
+            "【完成订单量】通过美团配送且最终状态为完成的订单数量。",
+        ]
+
+    def case_joined_labels_are_not_split_again() -> None:
+        calculation = _readable_text_lines("举例结束。计算示例：按下列订单计算。")
+        punctuality = _readable_text_lines(
+            "【肯德基体验得分】考核“品牌方口径准时率（肯德基）”"
+        )
+        source = _readable_text_lines("⑤ 数据获取方式：联系渠道经理；")
+        assert "计算\n示例" not in "\n".join(calculation)
+        assert any(line.startswith("计算示例：") for line in calculation)
+        assert punctuality == ["【肯德基体验得分】考核“品牌方口径准时率（肯德基）”"]
+        assert source == ["⑤ 数据获取方式：联系渠道经理；"]
+
+        workflow = _readable_text_lines(
+            "数据来源：品牌方投诉。数据播报：次月下发。"
+            "降星规则：命中即降星。申诉流程及时效：一个工作日内申诉。"
+        )
+        assert workflow == [
+            "数据来源：品牌方投诉。",
+            "数据播报：次月下发。",
+            "降星规则：命中即降星。",
+            "申诉流程及时效：一个工作日内申诉。",
+        ]
+
+        numbered = _readable_text_lines(
+            "申诉超时自动放弃。（1）该城市有自然灾害。（2）因品牌方调整。"
+        )
+        assert numbered == [
+            "申诉超时自动放弃。",
+            "（1）该城市有自然灾害。",
+            "（2）因品牌方调整。",
+        ]
 
     def case_missing_numbered_heading_repaired() -> None:
         text = render_text(DocResult(blocks=[
@@ -1909,6 +2108,17 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         assert "    - 2.2.1 High-compression Encoder (p. 4)" in text
         assert "2 Related Works 42.1" not in text
 
+    def case_verified_wide_standard_table_stays_markdown() -> None:
+        text = render_text(DocResult(blocks=[
+            Block(kind="table", flags=["standard_markdown_table"], rows=[
+                ["管理模块", "培训对象", "学习路径", "考试机会", "管理方式", "数据ID", "计分规则"],
+                ["专送骑手", "全量骑手", "培训中心-安全保障", "不限制", "线上自学", "7594",
+                 "当应参通过率<90%时，B1=0；当应参通过率≥90%时，B1=应参通过率*20"],
+            ])
+        ]))
+        assert "| 管理模块 | 培训对象 | 学习路径 | 考试机会 | 管理方式 | 数据ID | 计分规则 |" in text
+        assert "- 管理模块：" not in text
+
     def case_english_bullets_split_into_markdown_items() -> None:
         text = render_text(DocResult(blocks=[
             Block(kind="para", text=(
@@ -1969,6 +2179,7 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.native_pdf_wide_benchmark_table_stays_markdown", case_native_pdf_wide_benchmark_table_stays_markdown),
         ("export.native_pdf_policy_table_still_exports_grouped_text", case_native_pdf_policy_table_still_exports_grouped_text),
         ("export.text_pdf_references_keep_numbers_and_urls", case_text_pdf_references_keep_numbers_and_urls),
+        ("export.structured_score_example_keeps_field_relationships", case_structured_score_example_keeps_field_relationships),
         ("export.image_table_exports_text_without_asset_link", case_image_table_exports_text_without_asset_link),
         ("export.image_table_preserves_caption_text", case_image_table_preserves_caption_text),
         ("export.table_preserves_high_value_text", case_table_preserves_high_value_text),
@@ -1980,6 +2191,8 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.single_column_collapsed_table_exports_grouped_text", case_single_column_collapsed_table_exports_grouped_text),
         ("export.complex_table_exports_readable_blocks_without_br", case_complex_table_exports_readable_blocks_without_br),
         ("export.score_example_phrase_not_split", case_score_example_phrase_not_split),
+        ("export.bracket_label_after_sentence_gets_own_line", case_bracket_label_after_sentence_gets_own_line),
+        ("export.joined_labels_are_not_split_again", case_joined_labels_are_not_split_again),
         ("export.missing_numbered_heading_repaired", case_missing_numbered_heading_repaired),
         ("export.exception_table_example_breaks_line", case_exception_table_example_breaks_line),
         ("export.exception_conditions_break_lines", case_exception_conditions_break_lines),
@@ -1992,6 +2205,7 @@ def builtin_check_cases() -> List[tuple[str, Callable[[], None]]]:
         ("export.standalone_numbered_paragraph_becomes_heading", case_standalone_numbered_paragraph_becomes_heading),
         ("export.toc_entries_do_not_become_body_headings", case_toc_entries_do_not_become_body_headings),
         ("export.text_pdf_toc_exports_nested_list", case_text_pdf_toc_exports_nested_list),
+        ("export.verified_wide_standard_table_stays_markdown", case_verified_wide_standard_table_stays_markdown),
         ("export.english_bullets_split_into_markdown_items", case_english_bullets_split_into_markdown_items),
         ("export.formula_text_blocks_grouped_as_original_math", case_formula_text_blocks_grouped_as_original_math),
         ("export.formula_tail_split_from_text_pdf_prose", case_formula_tail_split_from_text_pdf_prose),

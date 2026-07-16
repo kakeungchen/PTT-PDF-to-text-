@@ -16,6 +16,10 @@ class Block:
     page: int = 0
     confidence: float = 1.0
     flags: List[str] = field(default_factory=list)  # 质检警告，如 low_confidence
+    # OCR 表格的内部网格坐标；只在组装阶段用于跨页/嵌套表分列复扫，
+    # Markdown/Word 导出不会暴露这些调试数据。
+    grid_x: Optional[List[float]] = None
+    grid_y: Optional[List[float]] = None
 
 
 @dataclass

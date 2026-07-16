@@ -4,7 +4,12 @@ import unicodedata
 from typing import List, Tuple
 
 from .models import Block, Line
-from .normalize import is_noise_text, looks_truncated, table_suspect_score
+from .normalize import (
+    _is_reliable_repaired_structured_table,
+    is_noise_text,
+    looks_truncated,
+    table_suspect_score,
+)
 from .vision_ocr import StripProvider, ocr_strip
 
 # 明确的乱码信号
@@ -427,10 +432,17 @@ def qa_scan(blocks: List[Block]) -> Tuple[List[str], int]:
             n_flag += 1
             issues.append(f"块{i} 低置信度({blk.confidence:.2f}): "
                           f"{(blk.text or '')[:40]}")
-        if "table_low_confidence" in blk.flags and not _is_protected_native_pdf_table(blk):
+        verified_table = (
+            "table_repaired_verified" in (blk.flags or [])
+            or (blk.kind == "table"
+                and _is_reliable_repaired_structured_table(blk))
+        )
+        if ("table_low_confidence" in blk.flags
+                and not _is_protected_native_pdf_table(blk)
+                and not verified_table):
             n_flag += 1
             issues.append(f"块{i} 表格疑似列错位，建议人工复核")
-        elif (blk.kind == "table" and blk.rows
+        elif (blk.kind == "table" and blk.rows and not verified_table
               and not _is_protected_native_pdf_table(blk)):
             score = table_suspect_score(blk.rows)
             if score >= 3:

@@ -88,6 +88,7 @@ def audit_pdf_markdown_coverage(pdf_path: str,
     issues.extend(_check_review_markers(markdown_text))
     issues.extend(_check_toc_body_consistency(markdown_text))
     issues.extend(_check_heading_sequence_gaps(markdown_text))
+    issues.extend(_check_chinese_top_level_heading_integrity(markdown_text))
     issues.extend(_check_markdown_readability(markdown_text))
     issues.extend(_check_table_block_rendering(result.blocks, markdown_text))
     issues.extend(_check_image_block_coverage(result.blocks, markdown_text))
@@ -548,7 +549,22 @@ def _block_text_for_coverage(block: Block) -> str:
         parts.append(block.text)
     if block.rows:
         parts.extend(" ".join(c for c in row if c) for row in block.rows)
-    return "\n".join(parts)
+    return _strip_embedded_page_furniture("\n".join(parts))
+
+
+def _strip_embedded_page_furniture(text: str) -> str:
+    """Remove only page-footer fragments accidentally absorbed by OCR cells."""
+    if not text:
+        return ""
+    patterns = (
+        r"(?:\d{1,4})?[^。\n]{0,28}保密(?:资料|原则).*?"
+        r"(?:MTPS[-A-Z0-9]+|[A-Z]{1,5}-[A-Z]{1,5}-V\d{2}-20\d{6}|V\d{2}-20\d{6})",
+        r"【?保密资料[^】\n]{0,80}】?",
+    )
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.I)
+    return cleaned
 
 
 def _is_high_risk_raw_block(block: Block, compact: str) -> bool:
@@ -653,7 +669,23 @@ def _is_probable_source_heading(token: str, title: str) -> bool:
     title_compact = _compact(title)
     if len(re.findall(r"[\u4e00-\u9fff]", title_compact)) < 2:
         return False
+    # A page logo/slogan can be OCR'd as ``4把世界送到你手中`` and then look
+    # like a numeric section heading.  It is page furniture, not a missing
+    # section; the raw-region audit handles it through the normal noise path.
+    if re.fullmatch(r"(?:\d{0,3})?把世界[送医]到你手中", title_compact):
+        return False
     if re.fullmatch(r"20\d{2}", token or "") and re.match(r"年\d{1,2}月", title_compact):
+        return False
+    # Plain numeric OCR fragments inside a table/body line are not chapters.
+    # Real numeric headings in this corpus either have a dotted subsection
+    # token or a substantive title; short fragments such as ``24 点烽火台``
+    # and ``1 日因在烽`` must not create false missing-section failures.
+    if re.fullmatch(r"\d{1,2}", token or "") and len(title_compact) < 8:
+        return False
+    if re.fullmatch(r"\d{1,2}", token or "") and re.search(
+            r"烽火台|日因在烽|合作商在配送人员|点烽火台", title_compact):
+        return False
+    if re.fullmatch(r"\d{1,2}", token or "") and "留存目标达单量区间" in title_compact:
         return False
     if re.search(r"\d{4}年\d{1,2}月\d{1,2}日", token + title_compact):
         return False
@@ -715,6 +747,15 @@ def _split_toc_and_body(markdown_text: str) -> Tuple[List[str], List[str]]:
         if seen_entry:
             end = idx
             break
+    if not seen_entry:
+        # A compressed/low-confidence TOC image may leave only the ``目录``
+        # label.  Treat the first following Markdown heading as body content;
+        # otherwise all structural audits would accidentally inspect an empty
+        # document and report a false pass.
+        for idx in range(toc_start + 1, len(lines)):
+            if re.match(r"^#{1,6}\s+\S", lines[idx].strip()):
+                return [], lines[idx:]
+        return [], lines[toc_start + 1:]
     return toc_lines, lines[end:]
 
 
@@ -761,10 +802,28 @@ def _check_heading_sequence_gaps(markdown_text: str) -> List[str]:
     _, body_lines = _split_toc_and_body(markdown_text)
     tokens: List[str] = []
     for raw in body_lines:
-        line = raw.strip().lstrip("#").strip()
+        stripped = raw.strip()
+        # Only actual Markdown headings define document section order.  A
+        # flattened table may legitimately contain numbered policy items or
+        # definitions such as ``3.5`` and ``2.2``; treating those body lines as
+        # headings produced false missing-section failures.
+        if not stripped.startswith("#"):
+            continue
+        line = stripped.lstrip("#").strip()
         m = re.match(r"^(\d+(?:[.．]\d+){1,3})\s*", line)
         if m:
-            tokens.append(m.group(1).replace("．", "."))
+            token = m.group(1).replace("．", ".")
+            # Decimal scores, percentages and interval values are not
+            # subsection headings.  They commonly appear at the start of a
+            # complex table's raw line stream.
+            if token.split(".", 1)[0] == "0":
+                continue
+            # Parentheses are common in legitimate subsection titles, for
+            # example ``5.4.5 承托比（适用履约星巴克单的站点组）``.  Only
+            # reject characters that strongly indicate a numeric table/value.
+            if re.search(r"[%％［］\[\]]", line):
+                continue
+            tokens.append(token)
     issues: List[str] = []
     by_parent: Dict[str, List[int]] = {}
     for token in tokens:
@@ -800,6 +859,50 @@ def _check_heading_sequence_gaps(markdown_text: str) -> List[str]:
                     + "、".join(missing[:5])
                 )
     return issues[:12]
+
+
+def _check_chinese_top_level_heading_integrity(markdown_text: str) -> List[str]:
+    """Block duplicate or skipped Chinese top-level body sections."""
+    _, body_lines = _split_toc_and_body(markdown_text)
+    values = {
+        "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    }
+    headings: List[Tuple[int, str]] = []
+    for raw in body_lines:
+        match = re.match(
+            r"^#{1,4}\s+([一二三四五六七八九十]{1,3})、\s*(\S.*?)\s*$",
+            raw.strip(),
+        )
+        if not match or match.group(1) not in values:
+            continue
+        headings.append((values[match.group(1)], _compact(match.group(2))))
+    if len({number for number, _ in headings}) < 3:
+        return []
+    issues: List[str] = []
+    seen: Dict[Tuple[int, str], int] = {}
+    for item in headings:
+        seen[item] = seen.get(item, 0) + 1
+    duplicates = [
+        f"{number}.{title}" for (number, title), count in seen.items()
+        if count > 1
+    ]
+    if duplicates:
+        issues.append(
+            "覆盖审计: 正文一级章节重复 " + "、".join(duplicates[:5])
+        )
+    ordered: List[int] = []
+    for number, _ in headings:
+        if number not in ordered:
+            ordered.append(number)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current > previous + 1:
+            missing = [str(value) for value in range(previous + 1, current)]
+            issues.append(
+                "覆盖审计: 正文一级章节编号跳号，疑似缺失 "
+                + "、".join(missing[:5])
+            )
+    return issues[:8]
 
 
 def _check_section_coverage(source_text: str, markdown_text: str) -> List[str]:
@@ -895,7 +998,13 @@ def _check_image_block_coverage(blocks: List[Block],
         if _image_block_exported(blk, markdown_text):
             continue
         page = (blk.page or 0) + 1
-        issues.append(f"覆盖审计: 第{page}页图像/公式区域未输出 block={idx}")
+        bbox = ",".join(str(round(float(value), 1)) for value in blk.bbox)
+        snippet = _compact(blk.text or "")[:36]
+        flags = ",".join(blk.flags or []) or "none"
+        issues.append(
+            f"覆盖审计: 第{page}页图像/公式区域未输出 block={idx} "
+            f"bbox=[{bbox}] flags=[{flags}] text={snippet or '<empty>'}"
+        )
     return issues
 
 
@@ -970,6 +1079,8 @@ def _image_rows_are_important(blk: Block) -> bool:
 
 
 def _image_block_exported(blk: Block, markdown_text: str) -> bool:
+    if "formula_replaced_by_latex" in blk.flags:
+        return True
     md_compact = _compact(markdown_text)
     if _formula_fragment_replaced_by_latex(blk.text or "", markdown_text):
         return True
@@ -1018,6 +1129,10 @@ def _formula_fragment_replaced_by_latex(text: str, markdown_text: str) -> bool:
     for needles, latex_label in replacements:
         if all(needle in compact for needle in needles) and latex_label in markdown_text:
             return True
+    if ("A2" in compact and "A3" in compact
+            and re.search(r'A[L1I]?KA品[牌解]单', compact)
+            and r"\text{复合超时时长}" in markdown_text):
+        return True
     return False
 
 
@@ -1173,6 +1288,11 @@ def _missing_formula_left_sides(source: str, target: str) -> List[str]:
         if re.search(r"[（(][^）)]*\d+\s*[,，]\s*\d+", left_compact):
             continue
         if "分钟" in left_compact and re.search(r"A[123]", left_compact):
+            continue
+        if (re.search(r"班级|路径|平台|训练营", left_compact)
+                and re.search(r"(?:当|学习|通过|完成).*率$", left_compact)):
+            # A split table row can glue the training path to the next score
+            # condition.  The resulting prefix is not a formula left side.
             continue
         if "品牌体验得分" in left_compact:
             continue
@@ -1346,6 +1466,21 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         )
         assert _check_heading_sequence_gaps(md) == []
 
+    def case_chinese_top_level_duplicate_and_gap_fail() -> None:
+        duplicate = (
+            "目录\n\n"
+            "## 一、总则\n\n## 一、总则\n\n"
+            "## 二、管理框架\n\n## 三、违约责任说明\n"
+        )
+        issues = _check_chinese_top_level_heading_integrity(duplicate)
+        assert any("章节重复" in issue for issue in issues)
+        gap = (
+            "## 一、总则\n\n## 三、违约责任说明\n\n"
+            "## 四、申诉及其他说明\n"
+        )
+        issues = _check_chinese_top_level_heading_integrity(gap)
+        assert any("章节编号跳号" in issue for issue in issues)
+
     def case_raw_ka_57_rule_detail_missing_fails() -> None:
         raw_blocks = [
             Block(kind="heading", text="5.7 特殊场景体验融合考核的说明", level=4),
@@ -1466,6 +1601,20 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         md = "禁止入内\n高校范围内封闭，违规取消。\n"
         assert _check_image_block_coverage(blocks, md) == []
 
+    def case_formula_fragment_superseded_by_latex_is_covered() -> None:
+        latex = "$$\\text{复合超时时长}=\\frac{A1}{W}$$"
+        flagged = Block(
+            kind="image", page=0,
+            flags=["auto_image", "formula", "formula_replaced_by_latex"],
+            text="",
+        )
+        ocr_variant = Block(
+            kind="image", page=0, flags=["auto_image", "formula"],
+            text="ALKA品解单+A2KA品牌单+A3KA品解单",
+        )
+        assert _check_image_block_coverage([flagged], latex) == []
+        assert _check_image_block_coverage([ocr_variant], latex) == []
+
     def case_ka_required_formula_missing_fails() -> None:
         md = (
             "# 2026年6月KA品牌单月度考核制度\n"
@@ -1496,6 +1645,14 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         assert any("5.4.5" in issue for issue in issues)
         assert any("5.4.6" in issue for issue in issues)
 
+    def case_heading_with_parenthetical_title_counts_as_section() -> None:
+        md = (
+            "#### 5.4.4 KA 品牌客诉率\n"
+            "#### 5.4.5 承托比（适用履约星巴克单的站点组）\n"
+            "#### 5.4.6 虚假点送达率\n"
+        )
+        assert _check_heading_sequence_gaps(md) == []
+
     return [
         ("coverage.section_missing_key_terms_fails", case_section_missing_key_terms_fails),
         ("coverage.section_complete_passes", case_section_complete_passes),
@@ -1503,6 +1660,7 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.date_range_not_source_heading", case_date_range_not_source_heading),
         ("coverage.formula_field_label_not_left_side", case_formula_field_label_not_left_side),
         ("coverage.heading_gap_duplicate_child_does_not_fail", case_heading_gap_duplicate_child_does_not_fail),
+        ("coverage.chinese_top_level_duplicate_and_gap_fail", case_chinese_top_level_duplicate_and_gap_fail),
         ("coverage.raw_ka_57_rule_detail_missing_fails", case_raw_ka_57_rule_detail_missing_fails),
         ("coverage.raw_ka_57_rule_detail_complete_passes", case_raw_ka_57_rule_detail_complete_passes),
         ("coverage.raw_policy_table_item_missing_fails", case_raw_policy_table_item_missing_fails),
@@ -1512,6 +1670,8 @@ def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("coverage.standard_table_rendering_required", case_standard_table_rendering_required),
         ("coverage.tiny_image_row_fragment_not_blocking", case_tiny_image_row_fragment_not_blocking),
         ("coverage.multiline_image_text_covered_by_anchors", case_multiline_image_text_covered_by_anchors),
+        ("coverage.formula_fragment_superseded_by_latex_is_covered", case_formula_fragment_superseded_by_latex_is_covered),
         ("coverage.ka_required_formula_missing_fails", case_ka_required_formula_missing_fails),
         ("coverage.ka_required_formula_review_marker_fails", case_ka_required_formula_review_marker_fails),
+        ("coverage.heading_with_parenthetical_title_counts_as_section", case_heading_with_parenthetical_title_counts_as_section),
     ]

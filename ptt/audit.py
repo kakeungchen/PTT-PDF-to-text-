@@ -23,24 +23,29 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("账号水印残留", re.compile(
         r"(?i)(?:bm[_\\-]*ch|chenj|chenjia|i?ang[o0]l|"
         r"1ang[o0]1|ang10|iaqlan9|陈加强|陈加\d?)")),
+    ("页内品牌标语残留", re.compile(r"(?:\d{0,3}\s*)?把世界[送医]到你手中")),
     ("低置信文字残留", re.compile(r"识别置信度低")),
     ("公式需核对", re.compile(r"公式原文（需核对）|需对照原 PDF 核对")),
     ("公式OCR残片", re.compile(
         r"[CPRTWY]KA品牌单指标释义|"
         r"虚假点送达率\s*[=＝]\s*TKA品牌单WKA品牌单|"
-        r"配送原因未[完定]成率[^\n]*(?:Wex|PKA|KA[脚腳]M)")),
+        r"配送原因未[完定]成率[^\n]*(?:Wex|PKA|KA[脚腳]M)|"
+        r"A[L1I]?\s*KA品[牌解]单\s*\+\s*A2\s*KA品牌单\s*\+\s*A3\s*KA品[牌解]单")),
     ("旧式图片占位残留", re.compile(r"!\[(?:图片|表格截图|公式)\]\(<[^>]+>\)")),
     ("未文本化图片占位残留", re.compile(r"图片区域未能可靠文本化|不写入外部图片")),
     ("申诉误识别", re.compile(r"中诉|甲诉|不子申诉")),
     ("为/沩误识别", re.compile(r"沩")),
     ("已/己误识别", re.compile(r"己离职|己经")),
-    ("符号/数字误识别", re.compile(r"项//次|工有单天数|2 0:00|8 0%")),
+    ("符号/数字误识别", re.compile(
+        r"项//次|工有单天数|2 0:00|8 0%|\\\|[〉＞]|KKA品牌体验总得分")),
+    ("公式异常项目符号", re.compile(r"[；;][ \t]*[•·]")),
     ("目录标点噪声", re.compile(r"[一二三四五六七八九十]{1,3}、[，,；;:：]")),
     ("目录孤立编号", re.compile(r"(?m)^[一二三四五六七八九十]{1,3}、\s*$")),
     ("孤立页码残留", re.compile(r"(?m)^\s*\d{1,3}\s*$")),
     ("计分语句误识别", re.compile(
         r"得分力|兜底力|(?:膨胀系数|系数|占比|比例|权重|天气等级|天气指数)力|"
-        r"得分\s+-?\s*\d|签署准")),
+        r"得分\s+-?\s*\d|签署准|"
+        r"(?:特殊|普通)场景体验得分\s*[-－—]\s*(?:特殊|普通)场景品牌订单")),
     ("薪动力规则残留", re.compile(
         r"(?m)(?:^|\|)\s*0=\s*(?=\||$)|后白|留存日标|分数计算规\b|特场景|商服务费考核方案|"
         r"正常天气单恶劣天气单")),
@@ -53,7 +58,7 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
 	        r"肇月度|强排擅|站点组强推|集圴站|群合考核|则除异常单|汁算|方案）。|"
 	        r"谢味\s*恕|特妹|特珠|特株|场意|算分不例|多倍权甫|权甫|"
 	        r"300[zZ]|70046|级力\s*\d+|240天气|≤22|配送原因未完成率=Y2|XI|Xe|Yz|Zs|"
-            r"张冢口|品陳|品陈|"
+            r"张冢口|品陳|品陈|美國配送|准到好用|门店门店流失|形象的行（|"
 	        r"结算方案[）)]|KA星级结\b|K[iI]\s*[、,，]\s*K[zZ][.．]\s*K[sS]|"
         r"K[iI]分\s*[、,，]\s*K[aA]分|K[.．]{2}K[aA]|K[Ii]分|"
         r"K[sS]分K[Nn]分|Q1\s*[.．]\s*Q2")),
@@ -62,7 +67,19 @@ BAD_PATTERNS: List[Tuple[str, re.Pattern]] = [
         r"虚假点送达率\s*得分Xs|Z5120|XT\s*\|\s*0|Z：\s*\|\s*120|"
         r"目标骑手达成天数/要求\s*考核周期得分该考核周期总天数|"
         r"介于门槛值、\s*介于\s*0%到100%之间\s*等比例计算得分目标值之间|"
-        r"状态准")),
+        r"状态准|商服务费并考核上算|惩资结约站|"
+        r"违约责任不承担违场景|责任承担：站/月|"
+        r"责任承担：上降低三档|美团配送滋时好用|"
+        r"数据查计分规则询\s*ID|B1=0\s*7594|"
+        r"(?<!最)近班级-新任城|(?:管理模块[；;：:].*){2}")),
+    ("段落标签粘连", re.compile(
+        r"违规处罚列表请注意|(?<!Q)94[：:]|剔除虚订单|"
+        r"。计算\s*\n+\s*示例[:：]|考核“\s*\n+\s*品牌方口径准时率|"
+        r"计算示例[:：]\s*\n+\s*示例[:：]|"
+        r"数据来源[:：][^\n]{20,}数据播报[:：]|"
+        r"数据播报[:：][^\n]{20,}降星规则[:：]|"
+        r"出现以下行[，,]\s*影响|"
+        r"^[①②③④⑤⑥⑦⑧⑨⑩]\s*$|\d,\s+\d{3}\b", re.MULTILINE)),
     ("中国式表格错关联", re.compile(
         r"检核项目：(?:控|报|舍)(?:；|$)|"
         r"一级分类：站；检核项目：(?:建设|控)|"
@@ -567,6 +584,24 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         issue_types = [issue["type"] for issue in result["issues"]]
         _assert_true("公式OCR残片" in issue_types, "公式OCR残片")
 
+    def case_formula_bullet_glue_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("肯德基完单量占比；•肯德基体验得分\n")
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("公式异常项目符号" in issue_types, "公式异常项目符号")
+
+    def case_normal_semicolon_then_next_bullet_allowed() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("•电话客诉：可通过线上申诉；\n•风控抓取：可通过线上申诉。\n")
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_false("公式异常项目符号" in issue_types, "公式异常项目符号")
+
     def case_trailing_heading_glued_to_paragraph_blocks_pass() -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.md")
@@ -636,6 +671,51 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
             _assert_true(result["qa_warnings"], "qa_warnings")
         finally:
             qa_module.qa_scan = original_scan
+
+    def case_resolved_fallback_warning_does_not_block() -> None:
+        from .models import Block
+        from .pipeline import _blocking_issues_from_warnings
+
+        warning = "低置信区域已转为截图(y=120): 承托比 RKA品牌单"
+        block = Block(
+            kind="image",
+            text="承托比=RKA品牌单/WKA品牌单",
+            bbox=(0, 100, 200, 160),
+            flags=["auto_image", "formula"],
+        )
+        markdown = "$$\\text{承托比}=\\frac{R_{\\text{KA品牌单}}}{W_{\\text{KA品牌单}}}$$"
+        issues = _blocking_issues_from_warnings(
+            [warning], blocks=[block], markdown_text=markdown)
+        _assert_false(issues, "resolved fallback warning")
+
+    def case_unresolved_fallback_warning_still_blocks() -> None:
+        from .models import Block
+        from .pipeline import _blocking_issues_from_warnings
+
+        warning = "低置信区域已转为截图(y=120): 无法识别的重要公式"
+        block = Block(
+            kind="image", text="无法识别的重要公式",
+            bbox=(0, 100, 200, 160), flags=["auto_image", "formula"],
+        )
+        issues = _blocking_issues_from_warnings(
+            [warning], blocks=[block], markdown_text="# 输出\n")
+        _assert_true(issues, "unresolved fallback warning")
+
+    def case_discarded_toc_fallback_warning_does_not_block() -> None:
+        from .models import Block
+        from .pipeline import _blocking_issues_from_warnings
+
+        warning = (
+            "低置信区域已转为截图(y=120): "
+            "二、管理框架⋯⋯1三、违约责任说明⋯⋯8"
+        )
+        block = Block(
+            kind="image", text="", bbox=(0, 100, 300, 180),
+            flags=["auto_image", "discarded_toc_fragment"],
+        )
+        issues = _blocking_issues_from_warnings(
+            [warning], blocks=[block], markdown_text="# 正文\n")
+        _assert_false(issues, "discarded toc fallback warning")
 
     def case_critical_sections_missing() -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -732,6 +812,21 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         issue_types = [issue["type"] for issue in result["issues"]]
         _assert_true("表格结构可读性问题" in issue_types, "表格结构可读性问题")
 
+    def case_disinfection_table_spill_blocks_pass() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "out.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    "责任承担：违约责任不承担违场景 1 >=80%约责任。\n"
+                    "责任承担：站/月\n"
+                    "责任承担：上降低三档承担违约责任。\n"
+                    "内容：美团配送滋时好用考核周期内无提交记录。\n"
+                )
+            result = scan_markdown(path)
+        issue_types = [issue["type"] for issue in result["issues"]]
+        _assert_true("表格结构可读性问题" in issue_types,
+                     "表格结构可读性问题")
+
     def case_chinese_policy_table_misalignment_regression() -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "out.md")
@@ -789,13 +884,19 @@ def _audit_builtin_cases() -> List[Tuple[str, Callable[[], None]]]:
         ("audit.ka_star_settlement_amount_allowed", case_ka_star_settlement_amount_allowed),
         ("audit.formula_review_marker_blocks_pass", case_formula_review_marker_blocks_pass),
         ("audit.formula_ocr_fragment_blocks_pass", case_formula_ocr_fragment_blocks_pass),
+        ("audit.formula_bullet_glue_blocks_pass", case_formula_bullet_glue_blocks_pass),
+        ("audit.normal_semicolon_then_next_bullet_allowed", case_normal_semicolon_then_next_bullet_allowed),
         ("audit.trailing_heading_glued_to_paragraph_blocks_pass", case_trailing_heading_glued_to_paragraph_blocks_pass),
         ("audit.inline_math_word_glue_blocks_pass", case_inline_math_word_glue_blocks_pass),
         ("audit.convert_outputs_single_md_without_assets_or_layout", case_convert_outputs_single_md_without_assets_or_layout),
         ("audit.pipeline_table_warning_blocks_after_audit", case_pipeline_table_warning_blocks_after_audit),
+        ("audit.resolved_fallback_warning_does_not_block", case_resolved_fallback_warning_does_not_block),
+        ("audit.unresolved_fallback_warning_still_blocks", case_unresolved_fallback_warning_still_blocks),
+        ("audit.discarded_toc_fallback_warning_does_not_block", case_discarded_toc_fallback_warning_does_not_block),
         ("audit.critical_sections_missing", case_critical_sections_missing),
         ("audit.critical_sections_complete", case_critical_sections_complete),
         ("audit.table_readability_regression", case_table_readability_regression),
+        ("audit.disinfection_table_spill_blocks_pass", case_disinfection_table_spill_blocks_pass),
         ("audit.chinese_policy_table_misalignment_regression", case_chinese_policy_table_misalignment_regression),
         ("audit.policy_table_context_regression", case_policy_table_context_regression),
         ("audit.policy_table_context_valid", case_policy_table_context_valid),

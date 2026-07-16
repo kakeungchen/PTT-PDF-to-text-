@@ -8,7 +8,7 @@
 """
 import re
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -332,7 +332,7 @@ def _detect_hlines(provider: StripProvider, chunk_h: int = 4000,
         e = min(s + chunk_h, H)
         img = provider.get_strip(s, e)
         scale = img.width / W
-        mask = _ruling_mask(img)
+        mask = _ruling_mask(img, dark=dark)
         counts = mask.sum(axis=1)
         for y in np.where(counts >= min_len * scale)[0]:
             ln, x0, x1 = _max_run(mask[y])
@@ -342,14 +342,32 @@ def _detect_hlines(provider: StripProvider, chunk_h: int = 4000,
             break
         s = e - overlap
     raw.sort(key=lambda h: h.y)
-    # 相邻几像素同属一条粗线 -> 合并
+    # 相邻几像素同属一条粗线；而整块深色表头会被识别成密集线带。
+    # 粗线压成一条，宽线带只保留上下边界，不把色块内部计成多行。
     out: List[HLine] = []
-    for h in raw:
-        if out and h.y - out[-1].y <= 8 and _x_overlap(h, out[-1]) > 0.5:
-            out[-1].x0 = min(out[-1].x0, h.x0)
-            out[-1].x1 = max(out[-1].x1, h.x1)
+    cluster: List[HLine] = []
+
+    def flush_cluster() -> None:
+        if not cluster:
+            return
+        x0 = min(item.x0 for item in cluster)
+        x1 = max(item.x1 for item in cluster)
+        span = cluster[-1].y - cluster[0].y
+        if len(cluster) >= 3 and span >= 12:
+            out.append(HLine(cluster[0].y, x0, x1))
+            out.append(HLine(cluster[-1].y, x0, x1))
         else:
-            out.append(h)
+            out.append(HLine(int(np.median([item.y for item in cluster])), x0, x1))
+        cluster.clear()
+
+    for h in raw:
+        if (cluster and h.y - cluster[-1].y <= 20
+                and _x_overlap(h, cluster[-1]) > 0.5):
+            cluster.append(h)
+        else:
+            flush_cluster()
+            cluster.append(h)
+    flush_cluster()
     return out
 
 
@@ -404,6 +422,82 @@ def _gap_has_content(lines: List[Line], y0: float, y1: float,
     return False
 
 
+def _gap_has_section_heading(lines: List[Line], y0: float, y1: float,
+                             table_x0: float, table_x1: float) -> bool:
+    """Detect a hard document boundary even inside a virtual page band."""
+    table_w = max(1.0, table_x1 - table_x0)
+    for ln in lines:
+        if not (y0 + 3 < ln.cy < y1 - 3):
+            continue
+        text = re.sub(r'\s+', ' ', ln.text or "").strip()
+        # A real section heading sits at the table's left edge and is much
+        # narrower than the table.  Numbered clauses inside a cell are indented
+        # and/or long; treating those as boundaries fragments every tall row.
+        if (ln.x0 > table_x0 + 80
+                or ln.x1 - ln.x0 > table_w * 0.58
+                or len(text) > 56):
+            continue
+        if _looks_like_section_heading_text(text):
+            return True
+    return False
+
+
+def _gap_has_short_table_row_label(lines: List[Line], y0: float, y1: float,
+                                   table_x0: float, table_x1: float) -> bool:
+    """Recognize a short numbered item that only resembles a section title."""
+    table_w = max(1.0, table_x1 - table_x0)
+    for line in lines:
+        if not (y0 + 3 < line.cy < y1 - 3):
+            continue
+        text = re.sub(r'\s+', '', line.text or "")
+        if (line.x0 > table_x0 + 80
+                or line.x1 - line.x0 > table_w * 0.30
+                or len(text) > 12):
+            continue
+        if (re.match(r'^\d{1,2}[.．、]', text)
+                and not re.search(
+                    r'规则|说明|流程|制度|方案|总则|细则|考核|管控|申诉', text)):
+            return True
+    return False
+
+
+_SECTION_TITLE_END_RE = re.compile(
+    r'(?:\u89c4\u5219|\u8bf4\u660e|\u6d41\u7a0b|\u6807\u51c6|\u8303\u56f4|\u65b9\u6848|\u5b9a\u4e49|\u89e3\u91ca|\u7ec6\u5219|\u8981\u6c42|'
+    r'\u5236\u5ea6|\u9644\u4ef6|\u9644\u5f55|\u68c0\u6838|\u7ba1\u63a7|\u7533\u8bc9|\u67e5\u8be2|\u8003\u6838|\u8c03\u5206|\u603b\u5219|'
+    r'\u529e\u6cd5|\u6982\u8ff0|\u80cc\u666f|\u5f15\u8a00|\u7ed3\u8bba|\u53c2\u8003\u6587\u732e)$')
+
+
+def _looks_like_section_heading_text(text: str) -> bool:
+    """Conservative section-boundary test for OCR text.
+
+    A font-size classifier can promote a short continuation fragment such as
+    ``2. \u6b64\u9879\u7edf\u8ba1\u5408\u4f5c\u5546\u7ad9`` to a heading.  Only complete hierarchical
+    numbers, chapter markers, or short title-shaped top-level numbers are hard
+    boundaries; ordinary numbered clauses remain inside their table cell.
+    """
+    text = re.sub(r'\s+', ' ', text or "").strip()
+    if not text or len(text) > 56:
+        return False
+    if text.rstrip("：:") in {
+            "\u76ee\u5f55", "References", "\u53c2\u8003\u6587\u732e", "\u9644\u5f55", "\u8865\u5145\u8bf4\u660e", "\u7279别\u8bf4\u660e"}:
+        return True
+    if re.match(r'^\u7b2c[\u4e00-\u9fff\d]{1,4}[\u7ae0\u8282\u6761\u90e8\u5206]', text):
+        return True
+    if re.match(r'^\d{1,2}(?:[.\uff0e]\d{1,2}){1,3}[.\uff0e]?\s*'
+                r'[\u4e00-\u9fffA-Za-z\u3010]', text):
+        return True
+    if (len(text) <= 36
+            and re.match(r'^\d{1,2}[.\uff0e]\s*[\u4e00-\u9fffA-Za-z\u3010]', text)
+            and _SECTION_TITLE_END_RE.search(text)):
+        return True
+    if (len(text) <= 36
+            and re.match(r'^[\u4e00-\u9fff]{1,3}[\u3001.\uff0e]\s*'
+                         r'[\u4e00-\u9fffA-Za-z\u3010]', text)
+            and _SECTION_TITLE_END_RE.search(text)):
+        return True
+    return False
+
+
 def find_table_regions(provider: StripProvider, bands: PageBands,
                        lines: Optional[List[Line]] = None,
                        dark: int = 232,
@@ -422,13 +516,21 @@ def find_table_regions(provider: StripProvider, bands: PageBands,
             gap = h.y - prev.y
             same = False
             if _x_overlap(h, prev) > 0.55:
+                section_break = _gap_has_section_heading(
+                    lines, prev.y, h.y,
+                    min(h.x0, prev.x0), max(h.x1, prev.x1))
+                short_row_label = _gap_has_short_table_row_label(
+                    lines, prev.y, h.y,
+                    min(h.x0, prev.x0), max(h.x1, prev.x1))
+                bridged = (gap < 2400 and _vertical_bridge(
+                    provider, prev.y, h.y, max(h.x0, prev.x0),
+                    min(h.x1, prev.x1), max(dark, 245)))
                 if gap < 100:  # 紧邻的线（粗边框/紧凑行距）
                     same = True
-                elif gap < 2400 and _vertical_bridge(
-                        provider, prev.y, h.y, max(h.x0, prev.x0),
-                        min(h.x1, prev.x1), dark):
+                elif bridged and (not section_break or short_row_label):
                     same = True
-                elif (gap < 1400 and _x_match(h, prev) > 0.85
+                elif (not section_break
+                      and gap < 1400 and _x_match(h, prev) > 0.85
                       and _band_coverage(prev.y, h.y, bands) > 0.25
                       and not _gap_has_content(lines, prev.y, h.y, bands)):
                     same = True  # 跨分页带、x 范围一致、中间无正文的同表延续
@@ -439,16 +541,24 @@ def find_table_regions(provider: StripProvider, bands: PageBands,
     if cur:
         groups.append(cur)
 
-    out = []
+    candidates: List[Tuple[TableRegion, bool]] = []
     for grp in groups:
-        if len(grp) < 3:
+        if len(grp) < 2:
             continue
         y0, y1 = grp[0].y, grp[-1].y
         x0 = min(h.x0 for h in grp)
         x1 = max(h.x1 for h in grp)
         img = provider.get_strip(max(0, y0 - 5), min(provider.height, y1 + 5))
         scale = img.width / provider.width
-        mask = _ruling_mask(img)[:, int(x0 * scale):int(x1 * scale) + 1]
+        # Horizontal borders are usually dark enough for ``dark=232``, while
+        # many exported Chinese policy tables use much lighter vertical
+        # separators.  Missing one of those separators silently merges an
+        # entire responsibility column into the description column.  A lighter
+        # threshold is safe here because a candidate still has to run through
+        # at least 80% of a cell height and win votes across multiple rows.
+        vertical_dark = max(dark, 245)
+        mask = _ruling_mask(img, dark=vertical_dark)[
+            :, int(x0 * scale):int(x1 * scale) + 1]
         # 垂直边界判定：在某一"行"(相邻水平线之间)内贯通 >=80% 行高。
         # 细的贯通段是表格线；宽的贯通段是底纹色块，取其左右边缘当列边界。
         # 再要求出现在足够多的行里（排除汉字竖笔画的干扰）。
@@ -480,22 +590,68 @@ def find_table_regions(provider: StripProvider, bands: PageBands,
                     votes[rb] += 1
         if nrows_counted == 0:
             continue
-        need = max(1.0, nrows_counted * 0.4)
-        # 聚类候选位置（±6px 内合并投票）
-        vx = []
+        # 聚类候选位置（±6px 内合并投票）。同时保留一组“稳定列线”：
+        # 它们贯穿至少 80% 的有效行。中国式制度表常在某个外层单元格
+        # 里嵌套一张小表；那些内层列线只出现在局部行，不应把整张外表
+        # 拆成七八列。
         pos = np.where(votes > 0)[0]
-        cur, cur_v = [], 0.0
-        for p in pos:
-            if cur and p - cur[-1] > 6:
-                if cur_v >= need:
-                    vx.append(int(x0 + np.mean(cur) / scale))
-                cur, cur_v = [], 0.0
-            cur.append(p)
-            cur_v += votes[p]
-        if cur and cur_v >= need:
-            vx.append(int(x0 + np.mean(cur) / scale))
+
+        def clustered_vx(need: float) -> List[int]:
+            found: List[int] = []
+            cur: List[int] = []
+            cur_v = 0.0
+            for p in pos:
+                if cur and p - cur[-1] > 6:
+                    if cur_v >= need:
+                        found.append(int(x0 + np.mean(cur) / scale))
+                    cur, cur_v = [], 0.0
+                cur.append(int(p))
+                cur_v += votes[p]
+            if cur and cur_v >= need:
+                found.append(int(x0 + np.mean(cur) / scale))
+            return found
+
+        vx = clustered_vx(max(1.0, nrows_counted * 0.4))
+        stable_vx = clustered_vx(max(1.0, nrows_counted * 0.8))
+        if (nrows_counted >= 4 and len(stable_vx) >= 3
+                and len(vx) > len(stable_vx)):
+            extras = [x for x in vx if all(abs(x - sx) > 8 for sx in stable_vx)]
+            nested_intervals = {
+                i for x in extras for i in range(len(stable_vx) - 1)
+                if stable_vx[i] + 8 < x < stable_vx[i + 1] - 8
+            }
+            if len(extras) >= 2 and len(nested_intervals) == 1:
+                vx = stable_vx
         if len(vx) >= 2:
-            out.append(TableRegion(y0, y1, hys, vx, x0, x1))
+            candidates.append((
+                TableRegion(y0, y1, hys, vx, x0, x1),
+                len(grp) == 2,
+            ))
+
+    # A one-row continuation has exactly two horizontal borders.  It used to
+    # disappear because normal table detection required three borders.  Keep
+    # such a fragment only when it touches a multi-row table with the same
+    # column grid; this recovers cross-page rows without turning ordinary
+    # horizontal separators into tables.
+    regular = [region for region, single in candidates if not single]
+
+    def same_grid(a: TableRegion, b: TableRegion) -> bool:
+        return (len(a.vx) == len(b.vx)
+                and len(a.vx) >= 3
+                and max(abs(x - y) for x, y in zip(a.vx, b.vx)) <= 18)
+
+    out: List[TableRegion] = []
+    for region, single in candidates:
+        if not single:
+            out.append(region)
+            continue
+        near_matching = any(
+            same_grid(region, other)
+            and max(other.y0 - region.y1, region.y0 - other.y1, 0) <= 180
+            for other in regular
+        )
+        if near_matching:
+            out.append(region)
     return out
 
 
@@ -536,18 +692,87 @@ def build_table_block(region: TableRegion, lines: List[Line], page: int,
     rows = clean_table_noise_rows(rows)
     if not rows:
         return None, set()
+    continuation_ids, bbox_y1 = _append_trailing_table_continuation(
+        rows, region, lines)
+    if continuation_ids:
+        used_ids |= continuation_ids
+        flags.append("table_trailing_continuation")
+    else:
+        bbox_y1 = region.y1
     final_score = table_suspect_score(rows)
     if final_score >= 3:
         flags.append("table_low_confidence")
         flags.append("table_fallback")
         blk = Block(kind="image", rows=rows, page=page, confidence=conf,
-                    bbox=(region.x0, region.y0, region.x1, region.y1),
-                    flags=flags)
+                    bbox=(region.x0, region.y0, region.x1, bbox_y1),
+                    flags=flags, grid_x=list(vx), grid_y=list(hy))
         return blk, used_ids
     blk = Block(kind="table", rows=rows, page=page, confidence=conf,
-                bbox=(region.x0, region.y0, region.x1, region.y1),
-                flags=flags)
+                bbox=(region.x0, region.y0, region.x1, bbox_y1),
+                flags=flags, grid_x=list(vx), grid_y=list(hy))
     return blk, used_ids
+
+
+def _append_trailing_table_continuation(
+        rows: List[List[str]], region: TableRegion, lines: List[Line]
+        ) -> Tuple[set, float]:
+    """Attach a virtual-page continuation to the unfinished table cell.
+
+    Exported long screenshots sometimes close the table at a page footer and
+    continue only the right-most cell below the next page header.  Geometry
+    then reports a complete table followed by ordinary text, silently losing
+    the row association.  We attach only when the first continuation is close,
+    at least 80% of candidate lines occupy one column, and that destination
+    cell visibly ends mid-sentence.
+    """
+    if not rows or len(region.vx) < 2:
+        return set(), region.y1
+    candidates: List[Tuple[Line, int]] = []
+    first_y: Optional[float] = None
+    for line in sorted(lines, key=lambda item: (item.y0, item.x0)):
+        if line.cy <= region.y1 + 2:
+            continue
+        if line.cy > region.y1 + 900:
+            break
+        text = re.sub(r'\s+', ' ', line.text or "").strip()
+        if _looks_like_section_heading_text(text):
+            break
+        if is_noise_text(text):
+            continue
+        cx = (line.x0 + line.x1) / 2
+        ci = _bucket(cx, region.vx)
+        if ci is None:
+            continue
+        if first_y is None:
+            first_y = line.y0
+            if first_y - region.y1 > 140:
+                return set(), region.y1
+        candidates.append((line, ci))
+    if len(candidates) < 2:
+        return set(), region.y1
+
+    counts: dict = defaultdict(int)
+    for _, ci in candidates:
+        counts[ci] += 1
+    target, count = max(counts.items(), key=lambda item: item[1])
+    if count < 2 or count / len(candidates) < 0.8:
+        return set(), region.y1
+    row_index = next(
+        (idx for idx in range(len(rows) - 1, -1, -1)
+         if target < len(rows[idx]) and rows[idx][target].strip()),
+        None,
+    )
+    if row_index is None or not looks_truncated(rows[row_index][target]):
+        return set(), region.y1
+
+    chosen = [line for line, ci in candidates if ci == target]
+    continuation = _join_cell(cluster_rows(chosen)).strip()
+    if len(_norm(continuation)) < 8:
+        return set(), region.y1
+    prior = rows[row_index][target].rstrip()
+    joiner = "\n" if re.match(r'^(?:\d+[.\uff0e]\s*|[\uff08(]\d+[\uff09)])', continuation) else ""
+    rows[row_index][target] = prior + joiner + continuation
+    return {id(line) for line in chosen}, max(line.y1 for line in chosen)
 
 
 def _table_line_ids(region: TableRegion, lines: List[Line]) -> set:
@@ -683,7 +908,6 @@ def _table_rows_from_cell_ocr(provider: StripProvider, region: TableRegion,
                 l for l in cell_lines
                 if re.search(r'[0-9A-Za-z一-鿿Σ∑]', l.text)
                 and not is_noise_text(l.text)
-                and not (bands and bands.in_band(y0 + l.cy))
             ]
             if not cell_lines:
                 row.append("")
@@ -716,7 +940,7 @@ def _bucket(v: float, edges: List[int]) -> Optional[int]:
 
 
 _CELL_BREAK = re.compile(
-    r'^(\d{1,2}\.|[a-zA-Z][.、)）]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫]|[•·▪]|'
+    r'^(\d{1,2}[.．、)）]|[a-zA-Z][.、)）]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫]|[•·▪]|'
     r'[（(]\d{1,2}[)）]|场景[一二三四五六]|条件[一二三四五六]|情形[一二三四五六])')
 
 
@@ -735,6 +959,75 @@ def _join_cell(rows: List[List[Line]]) -> str:
         else:
             out += seg
     return out
+
+
+_SEGMENTED_COLUMN_BREAK = re.compile(
+    r'^(?:注|其中|补充说明|特别说明|数据来源|考核范围|责任承担|'
+    r'场景[一二三四五六七八九十\d]+)[:：]?')
+
+
+def _join_segmented_column(lines: List[Line]) -> str:
+    """Join a column OCR pass without erasing its visual row groups.
+
+    Narrow label columns often wrap one item across several tightly spaced
+    lines (``消毒`` + ``标准`` + ``化率``), while the next table item is
+    separated by a clearly larger vertical gap.  ``_join_cell`` deliberately
+    ignores that geometry, which made a complete re-scan readable only as one
+    long concatenated string.  Preserve only the meaningful gaps and explicit
+    list/section starts; ordinary wrapped lines still join as one value.
+    """
+    rows = cluster_rows(sorted(lines, key=lambda line: (line.y0, line.x0)))
+    visual_rows: List[Tuple[float, float, float, str]] = []
+    for row in rows:
+        text = _join_lines([row]).strip()
+        if not text:
+            continue
+        visual_rows.append((
+            min(line.y0 for line in row),
+            max(line.y1 for line in row),
+            max(line.h for line in row),
+            text,
+        ))
+    if not visual_rows:
+        return ""
+
+    heights = [item[2] for item in visual_rows]
+    gaps = [
+        max(0.0, visual_rows[i][0] - visual_rows[i - 1][1])
+        for i in range(1, len(visual_rows))
+    ]
+    ordinary_gaps = [gap for gap in gaps if gap <= float(np.median(heights))]
+    median_height = float(np.median(heights))
+    median_gap = float(np.median(ordinary_gaps)) if ordinary_gaps else 0.0
+    gap_break = max(18.0, median_height * 0.62, median_gap * 2.4)
+
+    paragraphs: List[str] = []
+    current = ""
+    previous_y1: Optional[float] = None
+    for y0, y1, _height, text in visual_rows:
+        gap = (y0 - previous_y1) if previous_y1 is not None else 0.0
+        force_break = bool(
+            current and (
+                gap > gap_break
+                or _CELL_BREAK.match(text)
+                or _SEGMENTED_COLUMN_BREAK.match(text)
+            )
+        )
+        if force_break:
+            paragraphs.append(current)
+            current = ""
+        if not current:
+            current = text
+        elif (current[-1:].isascii()
+              and current[-1:] not in "，。；：、）)"
+              and text[:1].isascii()):
+            current += " " + text
+        else:
+            current += text
+        previous_y1 = y1
+    if current:
+        paragraphs.append(current)
+    return "\n".join(paragraphs)
 
 
 def _join_lines(rows: List[List[Line]]) -> str:
@@ -1046,13 +1339,121 @@ def assemble_blocks(provider: StripProvider, lines: List[Line], page: int = 0,
 
     paras = _rows_to_paragraphs(rows, med_h, W, page)
     blocks.extend(paras)
-    blocks = _merge_table_fallback_fragments(blocks, W)
+    blocks = _split_inline_section_boundaries(blocks)
+    blocks = _merge_adjacent_table_continuations(blocks)
+    blocks = _merge_table_fallback_fragments(blocks, W, provider)
     blocks.sort(key=lambda b: b.bbox[1])
     return blocks, notes
 
 
-def _merge_table_fallback_fragments(blocks: List[Block],
-                                    page_w: float) -> List[Block]:
+def _split_inline_section_boundaries(blocks: List[Block]) -> List[Block]:
+    """Detach a trailing supplement heading from the preceding table text.
+
+    Vision can join the final continuation cell and ``补充说明`` into one
+    paragraph.  Leaving it joined either swallows the continuation or lets the
+    fallback merger consume the supplement.  The wording is preserved exactly;
+    only its block boundary is restored.
+    """
+    out: List[Block] = []
+    marker_re = re.compile(r'(补充说明|特别说明)\s*[:：]?')
+    for blk in blocks:
+        if blk.kind not in {"para", "heading"} or not blk.text:
+            out.append(blk)
+            continue
+        match = marker_re.search(blk.text)
+        if not match or match.start() < 8:
+            out.append(blk)
+            continue
+        prefix = blk.text[:match.start()].strip()
+        suffix = blk.text[match.end():].strip()
+        if not prefix:
+            out.append(blk)
+            continue
+
+        x0, y0, x1, y1 = blk.bbox
+        ratio = min(0.97, max(0.55, len(prefix) / max(1, len(blk.text))))
+        split_y = y0 + (y1 - y0) * ratio
+        if not suffix and match.end() >= len(blk.text) - 2:
+            # A trailing marker occupies its own visual line.  Character-count
+            # interpolation lands in the middle of that line, so reserve one
+            # OCR line of height before the marker instead.
+            reserve = max(42.0, min(90.0, (y1 - y0) * 0.12))
+            split_y = max(y0 + 1, y1 - reserve)
+        out.append(Block(
+            kind="para", text=prefix, page=blk.page,
+            confidence=blk.confidence, flags=list(blk.flags),
+            bbox=(x0, y0, x1, split_y),
+        ))
+        out.append(Block(
+            kind="heading", text=match.group(1), level=max(4, blk.level),
+            page=blk.page, confidence=blk.confidence,
+            bbox=(x0, split_y, x1, min(y1, split_y + 1)),
+        ))
+        if suffix:
+            out.append(Block(
+                kind="para", text=suffix, page=blk.page,
+                confidence=blk.confidence,
+                bbox=(x0, min(y1, split_y + 1), x1, y1),
+            ))
+    return out
+
+
+def _merge_adjacent_table_continuations(blocks: List[Block]) -> List[Block]:
+    """Join table pieces that share one proven grid and touch vertically.
+
+    A logical table can be split into ``header + rows``, a one-row fragment,
+    and a continuation below a virtual page footer.  Once every piece has the
+    same detected column boundaries, keeping them separate loses the header
+    relationship.  Intervening paragraphs/headings remain a hard barrier
+    because only consecutive table blocks are considered.
+    """
+    ordered = sorted(blocks, key=lambda b: (b.page, b.bbox[1], b.bbox[0]))
+    out: List[Block] = []
+
+    def same_grid(a: Block, b: Block) -> bool:
+        if not a.grid_x or not b.grid_x or len(a.grid_x) != len(b.grid_x):
+            return False
+        return (len(a.grid_x) >= 3
+                and max(abs(x - y) for x, y in zip(a.grid_x, b.grid_x)) <= 18)
+
+    def header_signature(row: List[str]) -> str:
+        compact = "".join(re.sub(r'\s+', '', cell or "") for cell in row)
+        return "".join(term for term in _COLUMN_HEADER_TERMS if term in compact)
+
+    for blk in ordered:
+        if (out and blk.kind == "table" and blk.rows
+                and out[-1].kind == "table" and out[-1].rows
+                and out[-1].page == blk.page
+                and 0 <= blk.bbox[1] - out[-1].bbox[3] <= 180
+                and same_grid(out[-1], blk)):
+            previous = out[-1]
+            first_header = header_signature(previous.rows[0])
+            next_header = header_signature(blk.rows[0])
+            if next_header and next_header != first_header:
+                out.append(blk)
+                continue
+            append_rows = blk.rows[1:] if next_header == first_header else blk.rows
+            previous.rows.extend(append_rows)
+            previous.bbox = (
+                min(previous.bbox[0], blk.bbox[0]),
+                previous.bbox[1],
+                max(previous.bbox[2], blk.bbox[2]),
+                max(previous.bbox[3], blk.bbox[3]),
+            )
+            previous.confidence = min(previous.confidence, blk.confidence)
+            previous.flags = list(dict.fromkeys(
+                previous.flags + blk.flags + ["table_continuation_merged"]))
+            if blk.grid_y:
+                previous.grid_y = list(dict.fromkeys(
+                    (previous.grid_y or []) + blk.grid_y))
+            continue
+        out.append(blk)
+    return out
+
+
+def _merge_table_fallback_fragments(blocks: List[Block], page_w: float,
+                                    provider: Optional[StripProvider] = None
+                                    ) -> List[Block]:
     """把紧邻低置信表格截图的表格残片一起保留为截图。
 
     长截图式 PDF 里，一张逻辑表有时被检测成多个表格区域，中间夹出
@@ -1076,6 +1477,8 @@ def _merge_table_fallback_fragments(blocks: List[Block],
         while j < len(ordered) and ordered[j].page == blk.page:
             nxt = ordered[j]
             gap = nxt.bbox[1] - last.bbox[3]
+            if _is_section_boundary_block(nxt):
+                break
             if _is_table_fallback_block(nxt):
                 if gap > 900 and not saw_fragment:
                     break
@@ -1108,18 +1511,28 @@ def _merge_table_fallback_fragments(blocks: List[Block],
                     merged_texts.append(text)
             flags = ["table_low_confidence", "table_fallback",
                      "merged_table_fallback"]
+            segmented_rows = _column_segmented_fallback_rows(
+                provider, blk, y1, run) if provider is not None else None
+            if segmented_rows:
+                merged_rows = segmented_rows
+                if len(segmented_rows) > 2:
+                    flags.append("column_segmented_structured")
+                else:
+                    flags.append("column_segmented_fallback")
             out.append(Block(kind="image", page=blk.page,
-                             text="\n".join(merged_texts),
+                             text="" if segmented_rows else "\n".join(merged_texts),
                              rows=merged_rows or None,
                              confidence=min(b.confidence for b in run),
-                             bbox=(x0, y0, x1, y1), flags=flags))
+                             bbox=(x0, y0, x1, y1), flags=flags,
+                             grid_x=blk.grid_x, grid_y=blk.grid_y))
         else:
             out.append(blk)
         i = j
     fallback_refs = [b for b in out if _is_table_fallback_block(b)]
     final: List[Block] = []
     for blk in out:
-        if (_is_table_fragment_block(blk)
+        if (not _is_section_boundary_block(blk)
+                and _is_table_fragment_block(blk)
                 and _near_table_fallback(blk, fallback_refs)
                 and not _is_table_fallback_block(blk)):
             rows = blk.rows
@@ -1135,6 +1548,386 @@ def _merge_table_fallback_fragments(blocks: List[Block],
         else:
             final.append(blk)
     return final
+
+
+_COLUMN_HEADER_TERMS = (
+    "类型", "分类", "项目", "检核项目", "考核项目", "内容", "说明", "释义",
+    "责任承担", "承担责任", "数据来源", "查询路径", "指标", "数值", "备注",
+)
+
+
+def _drop_isolated_segmented_page_numbers(lines: List[Line]) -> List[Line]:
+    """Remove a virtual-page number from a per-column OCR pass.
+
+    A lone ``8`` inside a dense table can be legitimate, so numeric lines are
+    removed only when they sit in the wide blank/header gap between two page
+    fragments.  Normal adjacent numeric cells remain untouched.
+    """
+    ordered = sorted(lines, key=lambda line: (line.y0, line.x0))
+    kept: List[Line] = []
+    for index, line in enumerate(ordered):
+        text = re.sub(r'\s+', '', line.text or "")
+        if not re.fullmatch(r'\d{1,3}', text):
+            kept.append(line)
+            continue
+        previous_y1 = ordered[index - 1].y1 if index else line.y0
+        next_y0 = ordered[index + 1].y0 if index + 1 < len(ordered) else line.y1
+        before = max(0.0, line.y0 - previous_y1)
+        after = max(0.0, next_y0 - line.y1)
+        if max(before, after) > 180 and before + after > 240:
+            continue
+        kept.append(line)
+    return kept
+
+
+def _column_segmented_fallback_rows(
+        provider: StripProvider, root: Block, y1: float,
+        parts: Optional[List[Block]] = None
+        ) -> Optional[List[List[str]]]:
+    """Re-scan a merged complex table one outer column at a time.
+
+    A nested table often contributes local vertical rules that scramble the
+    outer grid.  Once stable outer boundaries are known, one OCR pass per
+    column preserves every continuation line while preventing text from the
+    adjacent responsibility column from being glued into the description.
+    The result deliberately remains a low-confidence fallback: it is readable
+    and complete-by-region, but does not claim row-level associations that the
+    visual grid could not prove.
+    """
+    if not root.rows or not root.grid_x or len(root.grid_x) < 3:
+        return None
+    ncol = len(root.grid_x) - 1
+    header = list(root.rows[0]) + [""] * max(0, ncol - len(root.rows[0]))
+    header = header[:ncol]
+    compact_header = "".join(re.sub(r'\s+', '', c or "") for c in header)
+    if sum(1 for term in _COLUMN_HEADER_TERMS if term in compact_header) < 2:
+        return None
+    if not root.grid_y or len(root.grid_y) < 2:
+        return None
+    data_y0 = int(root.grid_y[1]) + 2
+    data_y1 = min(provider.height, int(y1) + 2)
+    if data_y1 - data_y0 < 40 or data_y1 - data_y0 > 8000:
+        return None
+
+    strip = provider.get_strip(data_y0, data_y1)
+    column_lines: List[List[Line]] = []
+    useful = 0
+    for idx in range(ncol):
+        x0 = max(0, int(root.grid_x[idx]) + 3)
+        x1 = min(provider.width, int(root.grid_x[idx + 1]) - 3)
+        if x1 - x0 < 12:
+            column_lines.append([])
+            continue
+        crop = strip.crop((x0, 0, x1, strip.height))
+        try:
+            col_lines = ocr_strip(crop, upscale_to=1800)
+        except Exception:
+            return None
+        col_lines = [
+            line for line in col_lines
+            if re.search(r'[0-9A-Za-z一-鿿Σ∑]', line.text)
+            and not is_noise_text(line.text)
+        ]
+        col_lines = _drop_isolated_segmented_page_numbers(col_lines)
+        if not col_lines:
+            column_lines.append([])
+            continue
+        col_lines.sort(key=lambda line: (line.y0, line.x0))
+        column_lines.append(col_lines)
+        value = _join_segmented_column(col_lines).strip()
+        if len(_norm(value)) >= 8:
+            useful += 1
+    if useful < 2:
+        return None
+
+    # A supplement label can share the final OCR paragraph with a continued
+    # table cell.  Keep it out of every column; the detached heading block is
+    # emitted separately by ``_split_inline_section_boundaries``.
+    stop_y: Optional[float] = None
+    if column_lines:
+        for line in column_lines[0]:
+            compact = _norm(line.text)
+            if (re.match(r'^补充(?:说|识|明)', compact)
+                    or re.match(r'^补.{0,4}$', compact)):
+                stop_y = line.y0
+                break
+    if stop_y is not None:
+        column_lines = [
+            [line for line in lines if line.y0 < stop_y - 2]
+            for lines in column_lines
+        ]
+
+    structured = _recover_segmented_policy_rows(
+        provider, root, header, column_lines, data_y0, parts or [])
+    if structured:
+        return structured
+
+    values = [
+        _join_segmented_column(lines).strip() if lines else ""
+        for lines in column_lines
+    ]
+    return [header, values]
+
+
+def _recover_segmented_policy_rows(
+        provider: StripProvider, root: Block, header: List[str],
+        columns: List[List[Line]], data_y0: int,
+        parts: List[Block]) -> Optional[List[List[str]]]:
+    """Recover a merged three-column policy table from independent OCR passes.
+
+    This targets a layout class, not a document title: a narrow item column,
+    a prose column, and a responsibility column that may itself contain a
+    ruled subtable.  Row labels supply the outer order; prose and responsibility
+    text are aligned independently so a nested table cannot shift both columns.
+    """
+    if len(columns) != 3 or len(header) < 3:
+        return None
+    compact_header = [_norm(cell) for cell in header[:3]]
+    if ("项目" not in compact_header[0]
+            or compact_header[1] not in {"内容", "说明", "释义"}
+            or not any(term in compact_header[2]
+                       for term in ("责任承担", "承担责任"))):
+        return None
+
+    labels = _segmented_label_groups(columns[0])
+    if not 2 <= len(labels) <= 12:
+        return None
+    centers = [item[2] for item in labels]
+    content_groups = _assign_column_by_centers(columns[1], centers)
+    responsibility_groups = _responsibility_column_groups(
+        columns[2], centers, content_groups)
+    if (len(content_groups) != len(labels)
+            or len(responsibility_groups) != len(labels)):
+        return None
+
+    rows: List[List[str]] = [header[:3]]
+    for label, content_lines, responsibility_lines in zip(
+            labels, content_groups, responsibility_groups):
+        label_text = label[3]
+        content = _join_segmented_column(content_lines).strip()
+        responsibility = _join_segmented_column(responsibility_lines).strip()
+        if (len(_norm(label_text)) < 2 or len(_norm(content)) < 8
+                or len(_norm(responsibility)) < 8):
+            return None
+        rows.append([label_text, content, responsibility])
+
+    nested = _recover_nested_scenario_table(provider, root, parts)
+    nested_candidates = [
+        part for part in parts
+        if part is not root and part.grid_x and part.grid_y
+        and len(part.grid_x) >= 3
+        and root.grid_x
+        and root.grid_x[-2] - 12 <= part.grid_x[0]
+        and part.grid_x[-1] <= root.grid_x[-1] + 12
+        and "场景" in _flatten_block_text(part)
+    ]
+    if nested_candidates and not nested:
+        return None
+    if nested:
+        prefix = rows[1][2].splitlines()[0].strip()
+        if not re.match(r'^1\s*[、.．]', prefix):
+            prefix = ""
+        nested_header, nested_body = nested[0], nested[1:]
+        nested_lines = []
+        if prefix:
+            nested_lines.append(prefix)
+        for nested_row in nested_body:
+            nested_lines.append(
+                f"{nested_row[0]}：{nested_header[1]}：{nested_row[1]}；"
+                f"{nested_header[2]}：{nested_row[2]}"
+            )
+        rows[1][2] = "\n".join(nested_lines)
+
+    if any("补充说明" in _norm(cell) for row in rows for cell in row):
+        return None
+    return rows
+
+
+def _segmented_label_groups(
+        lines: List[Line]) -> List[Tuple[float, float, float, str]]:
+    """Join vertically wrapped labels while preserving real row gaps."""
+    ordered = sorted(lines, key=lambda line: (line.y0, line.x0))
+    if not ordered:
+        return []
+    median_height = float(np.median([max(1.0, line.h) for line in ordered]))
+    gap_break = max(55.0, median_height * 1.65)
+    groups: List[List[Line]] = []
+    for line in ordered:
+        if (groups
+                and line.y0 - max(item.y1 for item in groups[-1]) > gap_break):
+            groups.append([])
+        if not groups:
+            groups.append([])
+        groups[-1].append(line)
+
+    out: List[Tuple[float, float, float, str]] = []
+    for group in groups:
+        text = _norm(_join_segmented_column(group))
+        if (not text or re.match(r'^补充(?:说|识|明)', text)
+                or re.match(r'^补.{0,4}$', text)):
+            break
+        y0 = min(line.y0 for line in group)
+        y1 = max(line.y1 for line in group)
+        out.append((y0, y1, (y0 + y1) / 2.0, text))
+    return out
+
+
+def _assign_column_by_centers(
+        lines: List[Line], centers: List[float]) -> List[List[Line]]:
+    groups: List[List[Line]] = [[] for _ in centers]
+    if not centers:
+        return groups
+    boundaries = [
+        (centers[index] + centers[index + 1]) / 2.0
+        for index in range(len(centers) - 1)
+    ]
+    for line in sorted(lines, key=lambda item: (item.y0, item.x0)):
+        cy = line.cy
+        target = 0
+        while target < len(boundaries) and cy >= boundaries[target]:
+            target += 1
+        groups[target].append(line)
+    return groups
+
+
+def _responsibility_column_groups(
+        lines: List[Line], centers: List[float],
+        content_groups: List[List[Line]]) -> List[List[Line]]:
+    """Split responsibility cells by proven top-level numbering.
+
+    Nested lists use ``1）``/``2）`` and remain inside their cell.  A top-level
+    ``1、``/``2、``/``3、`` sequence is treated as outer-row evidence.  If
+    the last row has no explicit number, its start is matched to the already
+    recovered content-row start and a sentence boundary.
+    """
+    ordered = sorted(lines, key=lambda item: (item.y0, item.x0))
+    nrows = len(centers)
+    if not ordered or nrows == 0:
+        return [[] for _ in centers]
+
+    markers: List[Tuple[int, int]] = []
+    expected = 1
+    for index, line in enumerate(ordered):
+        match = re.match(r'^\s*(\d{1,2})\s*、', line.text or "")
+        if not match:
+            continue
+        number = int(match.group(1))
+        if number == expected and number <= nrows:
+            markers.append((number - 1, index))
+            expected += 1
+    if not markers or markers[0][0] != 0 or len(markers) < min(2, nrows - 1):
+        return _assign_column_by_centers(ordered, centers)
+
+    starts = {row_index: line_index for row_index, line_index in markers}
+    previous_start = max(starts.values())
+    for row_index in range(len(markers), nrows):
+        content_start = (min(line.y0 for line in content_groups[row_index])
+                         if content_groups[row_index] else centers[row_index])
+        candidates: List[Tuple[float, int]] = []
+        for index in range(previous_start + 1, len(ordered)):
+            current = ordered[index]
+            previous = ordered[index - 1]
+            current_text = (current.text or "").strip()
+            previous_text = (previous.text or "").strip()
+            sentence_start = (
+                bool(re.search(r'[。；;!！?？]　?$', previous_text))
+                and bool(re.match(r'^(?:若|当|考核|包括|对于|站点|骑手|无)',
+                                  current_text))
+            )
+            if sentence_start:
+                candidates.append((abs(current.y0 - content_start), index))
+        nearby = [item for item in candidates
+                  if item[0] <= max(140.0, ordered[0].h * 4.0)]
+        if not nearby:
+            return _assign_column_by_centers(ordered, centers)
+        _, chosen = min(nearby)
+        starts[row_index] = chosen
+        previous_start = chosen
+
+    if set(starts) != set(range(nrows)):
+        return _assign_column_by_centers(ordered, centers)
+    groups: List[List[Line]] = []
+    ordered_starts = [starts[index] for index in range(nrows)]
+    if ordered_starts != sorted(ordered_starts):
+        return _assign_column_by_centers(ordered, centers)
+    for index, start in enumerate(ordered_starts):
+        end = ordered_starts[index + 1] if index + 1 < nrows else len(ordered)
+        groups.append(ordered[start:end])
+    return groups
+
+
+def _recover_nested_scenario_table(
+        provider: StripProvider, root: Block,
+        parts: List[Block]) -> Optional[List[List[str]]]:
+    """Read a ruled subtable embedded inside the last outer column."""
+    if not root.grid_x or not root.grid_y or len(root.grid_y) < 3:
+        return None
+    candidates = [
+        part for part in parts
+        if part is not root and part.rows and part.grid_x and part.grid_y
+        and len(part.grid_x) == 4
+        and root.grid_x[-2] - 12 <= part.grid_x[0]
+        and part.grid_x[-1] <= root.grid_x[-1] + 12
+        and "场景" in _flatten_block_text(part)
+    ]
+    for candidate in candidates:
+        edges = sorted(set(
+            int(y) for y in list(root.grid_y[2:]) + list(candidate.grid_y)
+            if root.grid_y[1] < y <= candidate.grid_y[-1]
+        ))
+        if len(edges) < 4:
+            continue
+        for start in range(min(3, len(edges) - 3)):
+            trial_edges = edges[start:]
+            region = TableRegion(
+                trial_edges[0], trial_edges[-1], trial_edges,
+                list(candidate.grid_x), candidate.grid_x[0],
+                candidate.grid_x[-1],
+            )
+            rows, _confidence = _table_rows_from_cell_ocr(provider, region)
+            if len(rows) < 4 or len(rows[0]) < 3:
+                continue
+            header = [_norm(cell) for cell in rows[0][:3]]
+            if ("场景" not in header[0] or "标准化率" not in header[1]
+                    or "责任" not in header[2]):
+                continue
+            cleaned: List[List[str]] = [["场景", "标准化率", "违约责任"]]
+            numbers: List[int] = []
+            valid = True
+            for row in rows[1:]:
+                padded = list(row) + [""] * max(0, 3 - len(row))
+                scenario = re.sub(r'\s+', ' ', padded[0]).strip()
+                match = re.search(r'场景\s*(\d+)', scenario)
+                if not match:
+                    valid = False
+                    break
+                number = int(match.group(1))
+                rate = _normalize_rate_interval(padded[1])
+                responsibility = re.sub(r'\s+', ' ', padded[2]).strip()
+                if ("%" not in rate
+                        or not ("不承担" in responsibility
+                                or re.search(r'\d+\s*元', responsibility))):
+                    valid = False
+                    break
+                numbers.append(number)
+                cleaned.append([f"场景 {number}", rate, responsibility])
+            if valid and len(numbers) >= 3 and numbers == list(
+                    range(numbers[0], numbers[0] + len(numbers))):
+                return cleaned
+    return None
+
+
+def _normalize_rate_interval(text: str) -> str:
+    compact = re.sub(r'\s+', '', text or "")
+    compact = compact.replace("＜", "<").replace("＞", ">").replace("，", ",")
+    interval = re.search(r'[【\[]?(\d+)%?,(\d+)%?[）)]?', compact)
+    if interval:
+        return f"[{interval.group(1)}%, {interval.group(2)}%)"
+    threshold = re.search(r'([<>]̲?|[≥≤])\s*(\d+)%', compact)
+    if threshold:
+        op = threshold.group(1).replace(">̲", "≥").replace("<̲", "≤")
+        return f"{op}{threshold.group(2)}%"
+    return compact
 
 
 def _near_table_fallback(blk: Block, refs: List[Block]) -> bool:
@@ -1179,8 +1972,27 @@ def _is_table_fragment_block(blk: Block) -> bool:
 
     score = _table_fragment_signal(text)
     if blk.kind == "heading" and score < 3:
-        return False
+        return (not _looks_like_section_heading_text(text)
+                and (score >= 1 or looks_truncated(text)))
     return score >= 3
+
+
+def _is_section_boundary_block(blk: Block) -> bool:
+    """Return True for headings that must never be absorbed into a table.
+
+    Long image PDFs often place a new numbered section very close to the
+    preceding table.  Treating that heading as a table fragment caused several
+    independent policy tables to be merged into one unreadable fallback block.
+    """
+    text = re.sub(r'\s+', ' ', _flatten_block_text(blk)).strip()
+    # Long supplement paragraphs are often emitted as a one-cell table
+    # fragment, not a heading.  They still terminate the preceding table and
+    # must survive as an independent paragraph.
+    if re.search(r'(?:^|[。；;])\s*(?:补充说明|特别说明)[:：]?', text):
+        return True
+    if blk.kind not in {"heading", "para"}:
+        return False
+    return _looks_like_section_heading_text(text)
 
 
 def _table_fragment_signal(text: str) -> int:
@@ -1202,6 +2014,8 @@ def _table_fragment_signal(text: str) -> int:
     if "烟感状态" in text and "双倍违约金" in text:
         score += 2
     if "包括但不限于" in text:
+        score += 2
+    if re.search(r'无(?:提交)?消毒记录|降低[一二三四五六七八九\d]+档', text):
         score += 2
     if looks_truncated(text):
         score += 1
@@ -1314,3 +2128,72 @@ def _classify_heading(text: str, h: float, med_h: float, nrows: int,
     if big and len(text) <= 24:
         return "heading", 1
     return "para", 0
+
+
+def builtin_check_cases() -> List[Tuple[str, Callable[[], None]]]:
+    def line(text: str, y0: float, y1: float) -> Line:
+        return Line(text=text, conf=1.0, x0=0, y0=y0, x1=100, y1=y1)
+
+    def case_inline_supplement_boundary_is_split() -> None:
+        blocks = [Block(
+            kind="para",
+            text="若累计出现超5名骑手，则降低三档承担违约责任。补充说明：",
+            bbox=(0, 100, 500, 300),
+        )]
+        result = _split_inline_section_boundaries(blocks)
+        assert len(result) == 2
+        assert result[0].text.endswith("承担违约责任。")
+        assert result[1].kind == "heading"
+        assert result[1].text == "补充说明"
+        assert result[0].bbox[3] <= result[1].bbox[1]
+
+    def case_segmented_policy_rows_keep_outer_labels() -> None:
+        labels = _segmented_label_groups([
+            line("消毒", 10, 30), line("标准", 34, 54),
+            line("化率", 58, 78), line("虚假", 260, 280),
+            line("消毒", 284, 304), line("安全", 500, 525),
+            line("无消", 900, 920), line("毒记", 924, 944),
+            line("录骑", 948, 968), line("手", 972, 992),
+            line("补芬记", 1100, 1120),
+        ])
+        assert [item[3] for item in labels] == [
+            "消毒标准化率", "虚假消毒", "安全", "无消毒记录骑手",
+        ]
+
+    def case_responsibility_sequence_keeps_unnumbered_tail() -> None:
+        responsibility = [
+            line("1、标准化率", 10, 30),
+            line("场景1", 40, 60),
+            line("2、审核人员处理虚假消毒。", 260, 290),
+            line("3、安全和虚假", 500, 530),
+            line("事件降低三档承担违约责任。", 760, 790),
+            line("若考核周期内出现1名骑手，则降低一档。", 900, 930),
+        ]
+        content = [
+            [line("标准化率内容。", 20, 40)],
+            [line("虚假消毒内容。", 250, 280)],
+            [line("安全内容。", 500, 530)],
+            [line("考核周期内无提交消毒记录。", 920, 950)],
+        ]
+        groups = _responsibility_column_groups(
+            responsibility, [50, 280, 530, 950], content)
+        assert len(groups) == 4
+        assert groups[1][0].text.startswith("2、")
+        assert groups[2][0].text.startswith("3、")
+        assert groups[3][0].text.startswith("若考核周期")
+
+    def case_rate_interval_normalization() -> None:
+        assert _normalize_rate_interval("【70%，80%）") == "[70%, 80%)"
+        assert _normalize_rate_interval("＜50%") == "<50%"
+        assert _normalize_rate_interval("≥80%") == "≥80%"
+
+    return [
+        ("assemble.inline_supplement_boundary_is_split",
+         case_inline_supplement_boundary_is_split),
+        ("assemble.segmented_policy_rows_keep_outer_labels",
+         case_segmented_policy_rows_keep_outer_labels),
+        ("assemble.responsibility_sequence_keeps_unnumbered_tail",
+         case_responsibility_sequence_keeps_unnumbered_tail),
+        ("assemble.rate_interval_normalization",
+         case_rate_interval_normalization),
+    ]
